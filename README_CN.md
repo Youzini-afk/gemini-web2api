@@ -35,7 +35,7 @@ python gemini_web2api.py
 | 字段 | 值 |
 |------|-----|
 | Base URL | `http://localhost:8081/v1` |
-| API Key | `none` (随便填) |
+| API Key | `none` (未启用鉴权时随便填；启用后填你的密钥) |
 | Model | `gemini-3.5-flash-thinking` |
 
 ### curl
@@ -118,11 +118,47 @@ SID=你的SID值; HSID=你的HSID值; SSID=你的SSID值; APISID=你的APISID值
   "retry_attempts": 3,
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
+  "api_key": null,
   "cookie_file": null,
   "proxy": null,
   "log_requests": true
 }
 ```
+
+## API Key 鉴权
+
+默认不启用鉴权，兼容旧行为。如果配置了密钥，请求 `/v1/models`、`/v1/chat/completions`、`/v1/responses` 时必须携带：
+
+```http
+Authorization: Bearer 你的密钥
+```
+
+**方式 1: 环境变量**
+
+```bash
+export GEMINI_WEB2API_API_KEY=你的密钥
+python gemini_web2api.py
+```
+
+也兼容：
+
+```bash
+export API_KEY=你的密钥
+```
+
+**方式 2: config.json**
+
+```json
+{"api_key": "你的密钥"}
+```
+
+也支持多个密钥：
+
+```json
+{"api_keys": ["密钥1", "密钥2"]}
+```
+
+客户端 API Key 填你的密钥即可。
 
 ## 代理配置
 

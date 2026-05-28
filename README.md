@@ -35,7 +35,7 @@ Server starts at `http://localhost:8081/v1`.
 | Field | Value |
 |-------|-------|
 | Base URL | `http://localhost:8081/v1` |
-| API Key | `none` (or anything) |
+| API Key | `none` (or anything when auth is disabled; your key when enabled) |
 | Model | `gemini-3.5-flash-thinking` |
 
 ### curl
@@ -118,11 +118,47 @@ Create `config.json` in the same directory:
   "retry_attempts": 3,
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
+  "api_key": null,
   "cookie_file": null,
   "proxy": null,
   "log_requests": true
 }
 ```
+
+## API Key Authentication
+
+Authentication is disabled by default for backward compatibility. If you configure an API key, requests to `/v1/models`, `/v1/chat/completions`, and `/v1/responses` must include:
+
+```http
+Authorization: Bearer your-key
+```
+
+**Method 1: Environment variable**
+
+```bash
+export GEMINI_WEB2API_API_KEY=your-key
+python gemini_web2api.py
+```
+
+The shorter variable name is also supported:
+
+```bash
+export API_KEY=your-key
+```
+
+**Method 2: config.json**
+
+```json
+{"api_key": "your-key"}
+```
+
+Multiple keys are also supported:
+
+```json
+{"api_keys": ["key-1", "key-2"]}
+```
+
+Use the configured key as the API key in OpenAI-compatible clients.
 
 ## Proxy
 

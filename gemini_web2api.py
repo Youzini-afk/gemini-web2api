@@ -22,6 +22,7 @@ import uuid
 import re
 import os
 import hashlib
+import hmac
 import argparse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -41,6 +42,7 @@ DEFAULT_CONFIG = {
     "log_requests": True,
     "cookie_file": None,
     "proxy": None,
+    "api_key": None,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -82,6 +84,18 @@ def log(msg: str):
     if CONFIG["log_requests"]:
         sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
         sys.stderr.flush()
+
+
+def get_api_keys() -> list:
+    """Return configured API keys. Empty list means authentication is disabled."""
+    value = CONFIG.get("api_keys") or CONFIG.get("api_key")
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [key.strip() for key in value.split(",") if key.strip()]
+    if isinstance(value, list):
+        return [str(key).strip() for key in value if str(key).strip()]
+    return []
 
 
 def load_cookie() -> tuple:
@@ -298,14 +312,44 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         log(fmt % args)
 
-    def send_json(self, data, status=200):
+    def send_json(self, data, status=200, headers=None):
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
+        if headers:
+            for key, value in headers.items():
+                self.send_header(key, value)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def is_authorized(self):
+        api_keys = get_api_keys()
+        if not api_keys:
+            return True
+
+        auth = self.headers.get("Authorization", "").strip()
+        if auth.lower().startswith("bearer "):
+            auth = auth[7:].strip()
+        x_api_key = self.headers.get("X-API-Key", "").strip()
+
+        candidates = [value for value in (auth, x_api_key) if value]
+        return any(
+            hmac.compare_digest(candidate, api_key)
+            for candidate in candidates
+            for api_key in api_keys
+        )
+
+    def require_auth(self):
+        if self.is_authorized():
+            return True
+        self.send_json(
+            {"error": {"message": "Unauthorized"}},
+            401,
+            {"WWW-Authenticate": "Bearer"},
+        )
+        return False
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -317,6 +361,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             if self.path == "/v1/models":
+                if not self.require_auth():
+                    return
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
@@ -337,8 +383,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else b""
             if self.path == "/v1/chat/completions":
+                if not self.require_auth():
+                    return
                 self.handle_chat(body)
             elif self.path == "/v1/responses":
+                if not self.require_auth():
+                    return
                 self.handle_responses(body)
             else:
                 self.send_json({"error": "not found"}, 404)
@@ -541,6 +591,10 @@ def main():
                 break
     load_config(config_path)
 
+    api_key = os.environ.get("GEMINI_WEB2API_API_KEY") or os.environ.get("API_KEY")
+    if api_key:
+        CONFIG["api_key"] = api_key
+
     if args.port:
         CONFIG["port"] = args.port
     if args.cookie_file:
@@ -559,6 +613,7 @@ def main():
     print(f"  Base URL:  http://localhost:{port}/v1")
     print(f"  Models:    {', '.join(MODELS.keys())}")
     print(f"  Cookie:    {'yes (' + CONFIG['cookie_file'] + ')' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
+    print(f"  API Auth:  {'enabled' if get_api_keys() else 'disabled'}")
     print(f"  Proxy:     {CONFIG.get('proxy') or 'none (uses system env HTTP_PROXY/HTTPS_PROXY)'}")
     print(f"  Retry:     {CONFIG['retry_attempts']}x / {CONFIG['retry_delay_sec']}s")
     print()

@@ -1,0 +1,13 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+config.json
+cookie.txt
+cookie.json
+*.log
+.DS_Store
