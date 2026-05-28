@@ -24,6 +24,8 @@ import os
 import hashlib
 import hmac
 import argparse
+import codecs
+from typing import Any
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
@@ -130,9 +132,9 @@ def make_sapisidhash(sapisid: str) -> str:
 
 # ─── Gemini Protocol ─────────────────────────────────────────────────────────
 
-def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
-    """Send prompt to Gemini StreamGenerate with retry."""
-    inner = [None] * 80
+def build_gemini_request(prompt: str, model_id: int, think_mode: int):
+    """Build a Gemini StreamGenerate request."""
+    inner = [None] * 80  # type: list[Any]
     inner[0] = [prompt, 0, None, None, None, None, 0]
     inner[1] = ["en"]
     inner[2] = ["", "", "", None, None, None, None, None, None, ""]
@@ -173,65 +175,165 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
 
+    return urllib.request.Request(url, data=body, headers=headers, method="POST")
+
+
+def open_gemini_request(req):
+    """Open a Gemini request, honoring configured proxy and TLS context."""
+    ctx = ssl.create_default_context()
+    proxy = CONFIG.get("proxy")
+    if proxy:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+            urllib.request.HTTPSHandler(context=ctx)
+        )
+        return opener.open(req, timeout=CONFIG["request_timeout_sec"])
+    return urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
+
+
+def _raise_last_error(last_err):
+    if last_err:
+        raise last_err
+    raise RuntimeError("upstream error")
+
+
+def open_gemini_stream(prompt: str, model_id: int, think_mode: int):
+    """Open Gemini StreamGenerate with retry and return the response object."""
+    req = build_gemini_request(prompt, model_id, think_mode)
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
         try:
-            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-            ctx = ssl.create_default_context()
-            proxy = CONFIG.get("proxy")
-            if proxy:
-                opener = urllib.request.build_opener(
-                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                    urllib.request.HTTPSHandler(context=ctx)
-                )
-                resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
-            else:
-                resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
-            return resp.read().decode("utf-8", errors="replace")
+            return open_gemini_request(req)
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
-    raise last_err
+    _raise_last_error(last_err)
 
 
-def clean_gemini_text(text: str) -> str:
+def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
+    """Send prompt to Gemini StreamGenerate with retry."""
+    last_err = None
+    for attempt in range(CONFIG["retry_attempts"]):
+        try:
+            resp = open_gemini_request(build_gemini_request(prompt, model_id, think_mode))
+            try:
+                return resp.read().decode("utf-8", errors="replace")
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            last_err = e
+            if attempt < CONFIG["retry_attempts"] - 1:
+                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+                time.sleep(CONFIG["retry_delay_sec"])
+    _raise_last_error(last_err)
+
+
+def clean_gemini_text(text: str, strip: bool = True) -> str:
     """Remove internal code execution artifacts."""
     text = re.sub(
         r'```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n.*?```\n?',
         '', text, flags=re.DOTALL
     )
-    return text.strip()
+    return text.strip() if strip else text
 
 
 def extract_response_text(raw: str) -> str:
     """Parse StreamGenerate response to extract final text."""
     texts = []
     for line in raw.split("\n"):
-        if '"wrb.fr"' not in line or len(line) < 200:
-            continue
-        try:
-            arr = json.loads(line)
-            inner_str = arr[0][2]
-            if not inner_str or len(inner_str) < 50:
-                continue
-            inner = json.loads(inner_str)
-            if isinstance(inner, list) and len(inner) > 4 and inner[4]:
-                for part in inner[4]:
-                    if isinstance(part, list) and len(part) > 1 and part[1]:
-                        if isinstance(part[1], list):
-                            for t in part[1]:
-                                if isinstance(t, str) and len(t) > 0:
-                                    texts.append(t)
-        except (json.JSONDecodeError, IndexError, TypeError):
-            pass
+        texts.extend(parse_gemini_frame_texts(line))
     text = ""
     for t in reversed(texts):
         if t.strip():
             text = t
             break
     return clean_gemini_text(text)
+
+
+def iter_gemini_response_lines(resp):
+    """Yield complete text lines from a streaming Gemini response."""
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    buf = ""
+    while True:
+        chunk = resp.read(4096)
+        if not chunk:
+            break
+        buf += decoder.decode(chunk)
+        while True:
+            nl = buf.find("\n")
+            if nl < 0:
+                break
+            line = buf[:nl]
+            buf = buf[nl + 1:]
+            if line.endswith("\r"):
+                line = line[:-1]
+            yield line
+    buf += decoder.decode(b"", final=True)
+    if buf:
+        if buf.endswith("\r"):
+            buf = buf[:-1]
+        yield buf
+
+
+def iter_gemini_frames(resp):
+    """Yield Gemini JSON frame lines, skipping guards, blanks, and length frames."""
+    for line in iter_gemini_response_lines(resp):
+        if line.startswith(")]}'"):
+            continue
+        if not line:
+            continue
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.isdigit():
+            continue
+        yield line
+
+
+def parse_gemini_frame_texts(line: str) -> list:
+    """Parse a single Gemini frame and return text snapshot strings."""
+    if '"wrb.fr"' not in line:
+        return []
+    texts = []
+    try:
+        arr = json.loads(line)
+        inner_str = arr[0][2]
+        if not inner_str:
+            return []
+        inner = json.loads(inner_str)
+        if isinstance(inner, list) and len(inner) > 4 and inner[4]:
+            for part in inner[4]:
+                if isinstance(part, list) and len(part) > 1 and part[1]:
+                    if isinstance(part[1], list):
+                        for t in part[1]:
+                            if isinstance(t, str) and len(t) > 0:
+                                texts.append(t)
+    except (json.JSONDecodeError, IndexError, TypeError):
+        pass
+    return texts
+
+
+def gemini_stream_text_snapshots(prompt: str, model_id: int, think_mode: int):
+    """Yield cumulative cleaned text snapshots as Gemini streams them."""
+    resp = open_gemini_stream(prompt, model_id, think_mode)
+    try:
+        current = ""
+        for frame in iter_gemini_frames(resp):
+            for text in parse_gemini_frame_texts(frame):
+                cleaned = clean_gemini_text(text, strip=False)
+                if cleaned != current:
+                    current = cleaned
+                    yield current
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
 
 
 # ─── OpenAI Format Helpers ───────────────────────────────────────────────────
@@ -323,6 +425,79 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def send_sse_headers(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        self.wfile.flush()
+
+    def write_sse_data(self, data):
+        if isinstance(data, str):
+            payload = data
+        else:
+            payload = json.dumps(data, ensure_ascii=False)
+        self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+        self.wfile.flush()
+
+    def stream_chat_delta(self, cid, model_name, delta, finish_reason=None):
+        chunk = {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model_name,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        self.write_sse_data(chunk)
+
+    def _stream_chat_realtime(self, cid, model_name, prompt, model_id, think_mode):
+        self.send_sse_headers()
+        self.stream_chat_delta(cid, model_name, {"role": "assistant"})
+        previous = ""
+        try:
+            for snapshot in gemini_stream_text_snapshots(prompt, model_id, think_mode):
+                if snapshot.startswith(previous):
+                    delta_text = snapshot[len(previous):]
+                else:
+                    lcp = 0
+                    limit = min(len(previous), len(snapshot))
+                    while lcp < limit and previous[lcp] == snapshot[lcp]:
+                        lcp += 1
+                    delta_text = snapshot[lcp:]
+                previous = snapshot
+                if delta_text:
+                    self.stream_chat_delta(cid, model_name, {"content": delta_text})
+            self.stream_chat_delta(cid, model_name, {}, "stop")
+            self.write_sse_data("[DONE]")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            try:
+                self.write_sse_data({"error": {"message": f"upstream error: {e}"}})
+                self.write_sse_data("[DONE]")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    def _stream_chat_buffered(self, cid, model_name, text, tool_calls):
+        self.send_sse_headers()
+        self.stream_chat_delta(cid, model_name, {"role": "assistant"})
+        if text:
+            self.stream_chat_delta(cid, model_name, {"content": text})
+        if tool_calls:
+            delta_tool_calls = []
+            for i, tc in enumerate(tool_calls):
+                tcd = dict(tc)
+                tcd["index"] = i
+                delta_tool_calls.append(tcd)
+            self.stream_chat_delta(cid, model_name, {"tool_calls": delta_tool_calls})
+            self.stream_chat_delta(cid, model_name, {}, "tool_calls")
+        else:
+            self.stream_chat_delta(cid, model_name, {}, "stop")
+        self.write_sse_data("[DONE]")
 
     def is_authorized(self):
         api_keys = get_api_keys()
@@ -433,29 +608,24 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
 
+        cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        if req.get("stream") and not tools:
+            self._stream_chat_realtime(cid, model_name, prompt, model_id, think_mode)
+            return
+
         try:
             text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
-        cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
             msg["tool_calls"] = tool_calls
         finish = "tool_calls" if tool_calls else "stop"
 
         if req.get("stream"):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                     "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
-            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
+            self._stream_chat_buffered(cid, model_name, text, tool_calls)
         else:
             self.send_json({
                 "id": cid, "object": "chat.completion", "created": int(time.time()),
