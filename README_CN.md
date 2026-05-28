@@ -10,7 +10,7 @@
 
 ## 特性
 
-- **零认证**: 不需要 API Key, 不需要 Google 账号 (匿名访问)
+- **可选密钥**: `api_keys` 为空时免密, 填入密钥后按 OpenAI Bearer Key 校验
 - **OpenAI 兼容**: 直接替换 `/v1/chat/completions` 和 `/v1/models`
 - **工具调用**: 完整的 Function Calling 支持 (OpenAI 格式)
 - **多模型**: Flash, Flash Thinking (2万字+输出), Pro, Auto, Lite
@@ -19,6 +19,7 @@
 - **跨平台**: 纯 Python, 无外部依赖
 - **流式输出**: SSE Streaming 支持
 - **Codex CLI**: Responses API (`/v1/responses`) 兼容 OpenAI Codex
+- **Gemini CLI**: Google 原生 API (`/v1beta/models`) 兼容 Gemini CLI
 
 ## 快速开始
 
@@ -35,7 +36,7 @@ python gemini_web2api.py
 | 字段 | 值 |
 |------|-----|
 | Base URL | `http://localhost:8081/v1` |
-| API Key | `none` (未启用鉴权时随便填；启用后填你的密钥) |
+| API Key | 未启用鉴权时随便填；启用后填你的密钥 |
 | Model | `gemini-3.5-flash-thinking` |
 
 ### curl
@@ -43,6 +44,7 @@ python gemini_web2api.py
 ```bash
 curl http://localhost:8081/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-your-key" \
   -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"你好!"}]}'
 ```
 
@@ -50,13 +52,26 @@ curl http://localhost:8081/v1/chat/completions \
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8081/v1", api_key="none")
+client = OpenAI(base_url="http://localhost:8081/v1", api_key="sk-your-key")
 resp = client.chat.completions.create(
     model="gemini-3.5-flash-thinking",
     messages=[{"role": "user", "content": "解释量子计算"}]
 )
 print(resp.choices[0].message.content)
 ```
+
+### Gemini CLI
+
+```bash
+export GEMINI_API_KEY=none
+export GOOGLE_GEMINI_BASE_URL=http://localhost:8081
+gemini
+```
+
+支持 Google 原生 API 端点:
+- `GET /v1beta/models` — 模型列表
+- `POST /v1beta/models/{model}:generateContent` — 非流式生成
+- `POST /v1beta/models/{model}:streamGenerateContent` — 流式生成 (SSE)
 
 ## 可用模型
 
@@ -119,6 +134,7 @@ SID=你的SID值; HSID=你的HSID值; SSID=你的SSID值; APISID=你的APISID值
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
   "api_key": null,
+  "api_keys": [],
   "cookie_file": null,
   "proxy": null,
   "log_requests": true
@@ -159,6 +175,32 @@ export API_KEY=你的密钥
 ```
 
 客户端 API Key 填你的密钥即可。
+
+当 `api_keys` 是空数组 `[]` 且 `api_key` 是 `null` 时不校验密钥。
+
+## Docker 部署
+
+```bash
+docker build -t gemini-web2api .
+docker run -d --name gemini-web2api -p 8080:8080 -e GEMINI_WEB2API_API_KEY=sk-your-key gemini-web2api
+```
+
+或使用 Docker Compose:
+
+```bash
+cp config.example.json config.json
+docker compose up -d
+```
+
+如需挂载 Cookie 文件:
+
+```bash
+docker run -d --name gemini-web2api -p 8080:8080 -v ./config.json:/app/config.json -v ./cookie.txt:/app/cookie.txt gemini-web2api
+```
+
+此时 `config.json` 中设置 `"cookie_file": "/app/cookie.txt"`.
+
+Zeabur Docker 部署时暴露容器端口 `8080`，只设置需要的环境变量即可，例如 `GEMINI_WEB2API_API_KEY`。
 
 ## 代理配置
 

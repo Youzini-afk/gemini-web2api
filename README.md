@@ -10,7 +10,7 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero authen
 
 ## Features
 
-- **Zero Auth**: No API key, no Google account needed (anonymous access)
+- **Optional API Keys**: no auth when `api_keys` is empty, OpenAI-style Bearer auth when configured
 - **OpenAI Compatible**: Drop-in replacement for `/v1/chat/completions` and `/v1/models`
 - **Tool Calling**: Full function calling support (OpenAI format)
 - **Multiple Models**: Flash, Flash Thinking (20k+ char output), Pro, Auto, Lite
@@ -19,6 +19,7 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero authen
 - **Cross-Platform**: Pure Python, no dependencies beyond stdlib
 - **Streaming**: SSE streaming support
 - **Codex CLI**: Responses API (`/v1/responses`) for OpenAI Codex integration
+- **Gemini CLI**: Google native API (`/v1beta/models`) for Gemini CLI compatibility
 
 ## Quick Start
 
@@ -35,7 +36,7 @@ Server starts at `http://localhost:8081/v1`.
 | Field | Value |
 |-------|-------|
 | Base URL | `http://localhost:8081/v1` |
-| API Key | `none` (or anything when auth is disabled; your key when enabled) |
+| API Key | anything when auth is disabled; your configured key when enabled |
 | Model | `gemini-3.5-flash-thinking` |
 
 ### curl
@@ -43,6 +44,7 @@ Server starts at `http://localhost:8081/v1`.
 ```bash
 curl http://localhost:8081/v1/chat/completions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-your-key" \
   -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
@@ -50,13 +52,26 @@ curl http://localhost:8081/v1/chat/completions \
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8081/v1", api_key="none")
+client = OpenAI(base_url="http://localhost:8081/v1", api_key="sk-your-key")
 resp = client.chat.completions.create(
     model="gemini-3.5-flash-thinking",
     messages=[{"role": "user", "content": "Explain quantum computing"}]
 )
 print(resp.choices[0].message.content)
 ```
+
+### Gemini CLI
+
+```bash
+export GEMINI_API_KEY=none
+export GOOGLE_GEMINI_BASE_URL=http://localhost:8081
+gemini
+```
+
+Supports Google native API endpoints:
+- `GET /v1beta/models` — list models
+- `POST /v1beta/models/{model}:generateContent` — non-streaming
+- `POST /v1beta/models/{model}:streamGenerateContent` — streaming (SSE)
 
 ## Available Models
 
@@ -119,6 +134,7 @@ Create `config.json` in the same directory:
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
   "api_key": null,
+  "api_keys": [],
   "cookie_file": null,
   "proxy": null,
   "log_requests": true
@@ -159,6 +175,32 @@ Multiple keys are also supported:
 ```
 
 Use the configured key as the API key in OpenAI-compatible clients.
+
+When `api_keys` is `[]` and `api_key` is `null`, authentication is disabled.
+
+## Docker
+
+```bash
+docker build -t gemini-web2api .
+docker run -d --name gemini-web2api -p 8080:8080 -e GEMINI_WEB2API_API_KEY=sk-your-key gemini-web2api
+```
+
+Or use Docker Compose:
+
+```bash
+cp config.example.json config.json
+docker compose up -d
+```
+
+To mount a cookie file:
+
+```bash
+docker run -d --name gemini-web2api -p 8080:8080 -v ./config.json:/app/config.json -v ./cookie.txt:/app/cookie.txt gemini-web2api
+```
+
+Set `"cookie_file": "/app/cookie.txt"` in `config.json`.
+
+For Zeabur Docker deployment, expose container port `8080` and set only the environment variables you need, for example `GEMINI_WEB2API_API_KEY`.
 
 ## Proxy
 

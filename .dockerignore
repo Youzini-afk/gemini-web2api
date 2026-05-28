@@ -1,5 +1,8 @@
 .git
 .gitignore
+.github/
+.idea/
+.venv/
 __pycache__/
 *.pyc
 *.pyo

@@ -6,11 +6,19 @@ Converts Google Gemini's web interface into an OpenAI-compatible API server.
 Zero authentication required. Works on any platform (Windows/macOS/Linux).
 
 Usage:
+    pip install httpx
     python gemini_web2api.py [--port 8081] [--config config.json]
 
 Client configuration (Cherry Studio, ChatBox, etc.):
     Base URL: http://localhost:8081/v1
     API Key: (anything or empty)
+
+How it works:
+    Sends requests directly to Gemini's public StreamGenerate endpoint.
+    The backend does not verify authentication for basic text generation.
+    Model selection via MODE_CATEGORY field [79] in the request payload.
+    This is NOT a user-tier spoofing attack - the endpoint simply doesn't
+    require auth for anonymous access.
 """
 import json
 import urllib.request
@@ -29,7 +37,13 @@ from typing import Any
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
-__version__ = "1.0.0"
+try:
+    import httpx
+    HAS_HTTPX = True
+except ImportError:
+    HAS_HTTPX = False
+
+__version__ = "1.1.0"
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -543,6 +557,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
                      "owned_by": "google", "description": c["desc"]}
                     for n, c in MODELS.items()
                 ]})
+            elif self.path.startswith("/v1beta/models"):
+                if not self.require_auth():
+                    return
+                self._handle_google_models_list()
             elif self.path == "/":
                 self.send_json({"status": "ok", "version": __version__,
                                 "models": list(MODELS.keys())})
@@ -565,6 +583,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 if not self.require_auth():
                     return
                 self.handle_responses(body)
+            elif self.path.endswith(":streamGenerateContent"):
+                if not self.require_auth():
+                    return
+                self._handle_google_generate(body, stream=True)
+            elif self.path.endswith(":generateContent"):
+                if not self.require_auth():
+                    return
+                self._handle_google_generate(body, stream=False)
             else:
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -609,7 +635,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        if req.get("stream") and not tools:
+        stream = req.get("stream", False)
+        if stream and not tools:
             self._stream_chat_realtime(cid, model_name, prompt, model_id, think_mode)
             return
 
@@ -624,7 +651,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             msg["tool_calls"] = tool_calls
         finish = "tool_calls" if tool_calls else "stop"
 
-        if req.get("stream"):
+        if stream:
             self._stream_chat_buffered(cid, model_name, text, tool_calls)
         else:
             self.send_json({
@@ -733,6 +760,113 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
                             "model": model_name, "output": output,
                             "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text)//4, "total_tokens": (len(prompt)+len(text))//4}})
+
+
+    # ─── Google Native API (Gemini CLI compatible) ────────────────────────────
+
+    def _parse_google_model_from_path(self):
+        """Extract model name from /v1beta/models/{model}:method path."""
+        m = re.match(r'/v1beta/models/([^:?]+)', self.path)
+        if m:
+            return m.group(1)
+        return None
+
+    def _handle_google_models_list(self):
+        """GET /v1beta/models — Google AI format model list."""
+        models = []
+        for name, cfg in MODELS.items():
+            models.append({
+                "name": f"models/{name}",
+                "displayName": name,
+                "description": cfg["desc"],
+                "supportedGenerationMethods": ["generateContent", "streamGenerateContent"],
+            })
+        self.send_json({"models": models})
+
+    def _google_contents_to_prompt(self, req: dict) -> str:
+        """Convert Google API contents format to prompt string."""
+        parts = []
+        sys_inst = req.get("systemInstruction")
+        if sys_inst:
+            sys_parts = sys_inst.get("parts", [])
+            sys_text = " ".join(p.get("text", "") for p in sys_parts if p.get("text"))
+            if sys_text:
+                parts.append(f"[System instruction]: {sys_text}")
+
+        for content in req.get("contents", []):
+            role = content.get("role", "user")
+            text_parts = []
+            for p in content.get("parts", []):
+                if p.get("text"):
+                    text_parts.append(p["text"])
+            text = " ".join(text_parts)
+            if role == "model":
+                parts.append(f"[Assistant]: {text}")
+            else:
+                parts.append(text)
+        return "\n\n".join(p for p in parts if p)
+
+    def _google_has_non_text_parts(self, req: dict) -> bool:
+        for content in req.get("contents", []):
+            for part in content.get("parts", []):
+                if "text" not in part:
+                    return True
+        return False
+
+    def _handle_google_generate(self, body: bytes, stream: bool):
+        """Handle Google native generateContent / streamGenerateContent."""
+        req = json.loads(body)
+        model_name = self._parse_google_model_from_path()
+        if not model_name:
+            self.send_json({"error": {"message": "model not specified in path"}}, 400)
+            return
+
+        model_name, model_id, think_mode, err = self._resolve_model(model_name)
+        if err:
+            self.send_json({"error": {"message": err}}, 400)
+            return
+
+        if self._google_has_non_text_parts(req):
+            self.send_json({"error": {"message": "Google native multimodal parts are not supported yet"}}, 400)
+            return
+
+        prompt = self._google_contents_to_prompt(req)
+        if not prompt.strip():
+            self.send_json({"error": {"message": "empty content"}}, 400)
+            return
+
+        try:
+            text, _ = self._call_gemini(prompt, model_id, think_mode, None)
+        except Exception as e:
+            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            return
+
+        candidate = {
+            "content": {"parts": [{"text": text or ""}], "role": "model"},
+            "finishReason": "STOP",
+            "index": 0,
+        }
+        usage = {
+            "promptTokenCount": len(prompt) // 4,
+            "candidatesTokenCount": len(text) // 4,
+            "totalTokenCount": (len(prompt) + len(text)) // 4,
+        }
+        response_obj = {
+            "candidates": [candidate],
+            "usageMetadata": usage,
+            "modelVersion": model_name,
+        }
+
+        if stream:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(f"data: {json.dumps(response_obj)}\n\n".encode())
+            self.wfile.flush()
+        else:
+            self.send_json(response_obj)
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
