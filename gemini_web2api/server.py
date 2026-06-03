@@ -4,13 +4,14 @@ import time
 import uuid
 import re
 import hmac
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
 from .config import CONFIG
 from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, log
-from .tools import messages_to_prompt, parse_tool_calls
+from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import upload_image, fetch_image_bytes
 from . import __version__
 
@@ -102,22 +103,23 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
+            path = urllib.parse.urlparse(self.path).path
             if self._requires_auth() and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
-            if self.path == "/v1/models":
+            if path == "/v1/models":
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path.startswith("/v1beta/models"):
+            elif path.startswith("/v1beta/models"):
                 self.send_json({"models": [
                     {"name": f"models/{n}", "displayName": n, "description": c["desc"],
                      "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path == "/":
+            elif path == "/":
                 self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
             else:
                 self.send_json({"error": "not found"}, 404)
@@ -126,18 +128,19 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            path = urllib.parse.urlparse(self.path).path
             if self._requires_auth() and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else b""
-            if self.path == "/v1/chat/completions":
+            if path == "/v1/chat/completions":
                 self._handle_chat(body)
-            elif self.path == "/v1/responses":
+            elif path == "/v1/responses":
                 self._handle_responses(body)
-            elif self.path.endswith(":streamGenerateContent"):
+            elif path.endswith(":streamGenerateContent"):
                 self._handle_google_generate(body, stream=True)
-            elif self.path.endswith(":generateContent"):
+            elif path.endswith(":generateContent"):
                 self._handle_google_generate(body, stream=False)
             else:
                 self.send_json({"error": "not found"}, 404)
@@ -157,14 +160,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if req is None:
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
-        model_name, model_id, think_mode, err = resolve_model(
+        model_name, model_id, think_mode, err, extra_fields = resolve_model(
             req.get("model", CONFIG["default_model"]))
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
 
         tools = req.get("tools")
-        prompt, images = messages_to_prompt(req.get("messages", []), tools)
+        tool_choice = req.get("tool_choice", "auto")
+        prompt, images = messages_to_prompt(req.get("messages", []), tools, tool_choice)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
@@ -172,14 +176,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
-        if stream and not tools:
+        if stream and (not tools or tool_choice == "none"):
             try:
                 self._start_sse()
                 role_chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                               "model": model_name, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}
                 self.wfile.write(f"data: {json.dumps(role_chunk, ensure_ascii=False)}\n\n".encode())
                 self.wfile.flush()
-                for delta in generate_stream(prompt, model_id, think_mode, _upload_images(images)):
+                for delta in generate_stream(prompt, model_id, think_mode, _upload_images(images), extra_fields):
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -194,13 +198,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, _upload_images(images))
+            text = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
         tool_calls = None
-        if tools and text:
+        if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
@@ -246,7 +250,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if req is None:
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
-        model_name, model_id, think_mode, err = resolve_model(
+        model_name, model_id, think_mode, err, extra_fields = resolve_model(
             req.get("model", CONFIG["default_model"]))
         if err:
             self.send_json({"error": {"message": err}}, 400)
@@ -294,19 +298,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
             tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters", {})}}
                      if t.get("type") == "function" and "function" not in t else t for t in tools]
 
-        prompt, images = messages_to_prompt(messages, tools)
+        tool_choice = req.get("tool_choice", "auto")
+        prompt, images = messages_to_prompt(messages, tools, tool_choice)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, _upload_images(images))
+            text = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
         tool_calls = None
-        if tools and text:
+        if tools and text and tool_choice != "none":
             text, tool_calls = parse_tool_calls(text)
 
         rid = f"resp_{uuid.uuid4().hex[:16]}"
@@ -321,11 +326,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                            "content": [{"type": "output_text", "text": text or "", "annotations": []}]})
 
         if req.get("stream"):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
+            self._start_sse()
             ev = {"type": "response.created", "response": {"id": rid, "object": "response", "status": "in_progress", "model": model_name, "output": []}}
             self.wfile.write(f"event: response.created\ndata: {json.dumps(ev)}\n\n".encode())
             for item in output:
@@ -352,52 +353,98 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if req is None:
             self.send_json({"error": {"message": "invalid JSON"}}, 400)
             return
-        m = re.match(r'/v1beta/models/([^:?]+)', self.path)
+        path = urllib.parse.urlparse(self.path).path
+        m = re.match(r'/v1beta/models/([^:?]+)', path)
         model_name = m.group(1) if m else CONFIG["default_model"]
-        model_name, model_id, think_mode, err = resolve_model(model_name)
+        model_name, model_id, think_mode, err, extra_fields = resolve_model(model_name)
         if err:
             self.send_json({"error": {"message": err}}, 400)
             return
 
-        for content in req.get("contents", []):
-            for part in content.get("parts", []):
-                if "text" not in part:
-                    self.send_json({"error": {"message": "Google native multimodal parts are not supported yet"}}, 400)
-                    return
+        tool_config = req.get("toolConfig", {})
+        fc_mode = tool_config.get("functionCallingConfig", {}).get("mode", "AUTO")
+        has_tools = bool(req.get("tools")) and fc_mode != "NONE"
+        prompt, images = google_contents_to_prompt(req)
+        if not prompt.strip():
+            self.send_json({"error": {"message": "empty content"}}, 400)
+            return
 
-        parts = []
-        sys_inst = req.get("systemInstruction")
-        if sys_inst:
-            sys_text = " ".join(p.get("text", "") for p in sys_inst.get("parts", []))
-            if sys_text:
-                parts.append(f"[System instruction]: {sys_text}")
-        for content in req.get("contents", []):
-            role = content.get("role", "user")
-            text = " ".join(p.get("text", "") for p in content.get("parts", []) if p.get("text"))
-            parts.append(f"[Assistant]: {text}" if role == "model" else text)
-        prompt = "\n\n".join(p for p in parts if p)
+        file_refs = _upload_images(images)
+        log(f"Google API: model={model_name} stream={stream} tools={has_tools} prompt_len={len(prompt)}")
+
+        if stream and not has_tools:
+            try:
+                self._start_sse()
+                full_text = ""
+                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                    if not delta:
+                        continue
+                    full_text += delta
+                    chunk_obj = {
+                        "candidates": [{"content": {"parts": [{"text": delta}], "role": "model"}, "index": 0}],
+                        "modelVersion": model_name,
+                    }
+                    self.wfile.write(f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+                final_chunk = {
+                    "candidates": [{"finishReason": "STOP", "index": 0}],
+                    "usageMetadata": {
+                        "promptTokenCount": len(prompt) // 4,
+                        "candidatesTokenCount": len(full_text) // 4,
+                        "totalTokenCount": (len(prompt) + len(full_text)) // 4,
+                    },
+                    "modelVersion": model_name,
+                }
+                self.wfile.write(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
 
         try:
-            text = generate(prompt, model_id, think_mode)
+            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
-        resp_obj = {
-            "candidates": [{"content": {"parts": [{"text": text or ""}], "role": "model"}, "finishReason": "STOP", "index": 0}],
-            "usageMetadata": {"promptTokenCount": len(prompt)//4, "candidatesTokenCount": len(text or "")//4, "totalTokenCount": (len(prompt)+len(text or ""))//4},
+        if not text:
+            log("Warning: empty response from Gemini")
+
+        response_parts = []
+        if has_tools and text:
+            clean_text, function_calls = parse_google_function_calls(text)
+            if function_calls:
+                if clean_text:
+                    response_parts.append({"text": clean_text})
+                for fc in function_calls:
+                    response_parts.append({"functionCall": {"name": fc["name"], "args": fc["args"]}})
+            else:
+                response_parts.append({"text": text})
+        else:
+            response_parts.append({"text": text or "I apologize, but I was unable to generate a response. Please try again."})
+
+        candidate = {
+            "content": {"parts": response_parts, "role": "model"},
+            "finishReason": "STOP",
+            "index": 0,
+        }
+        usage = {
+            "promptTokenCount": len(prompt) // 4,
+            "candidatesTokenCount": len(text or "") // 4,
+            "totalTokenCount": (len(prompt) + len(text or "")) // 4,
+        }
+        response_obj = {
+            "candidates": [candidate],
+            "usageMetadata": usage,
             "modelVersion": model_name,
         }
+
         if stream:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(f"data: {json.dumps(resp_obj)}\n\n".encode())
+            self._start_sse()
+            self.wfile.write(f"data: {json.dumps(response_obj, ensure_ascii=False)}\n\n".encode())
             self.wfile.flush()
         else:
-            self.send_json(resp_obj)
+            self.send_json(response_obj)
 
 
 class ThreadedServer(ThreadingMixIn, HTTPServer):

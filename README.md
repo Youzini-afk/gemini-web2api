@@ -120,6 +120,29 @@ Or use the JSON format:
 
 **Alternative (browser extension)**: Use any "Export Cookies" extension to export cookies for `gemini.google.com` in Netscape format, then convert to the single-line format above.
 
+### Authenticated account path and XSRF token
+
+If the signed-in Gemini page URL contains an account index, such as:
+
+```
+https://gemini.google.com/u/1/app/...
+```
+
+set `auth_user` to that index. Authenticated web requests may also require the page XSRF token. In the rendered Gemini page source, this token is exposed as `SNlM0e`; pass it as `xsrf_token` in `config.json`. The server sends it as the `at` form field.
+
+Example:
+
+```json
+{
+  "cookie_file": "/app/cookie.txt",
+  "auth_user": "1",
+  "xsrf_token": "AOOh0P...",
+  "gemini_bl": "boq_assistant-bard-web-server_YYYYMMDD.xx_p0"
+}
+```
+
+If authenticated requests return HTTP 400 with an `xsrf` error, refresh Gemini Web, update `xsrf_token`, and make sure `auth_user` matches the `/u/<index>/` part of the browser URL.
+
 No paid subscription needed — a free Google account is sufficient.
 
 ## Configuration
@@ -135,6 +158,9 @@ Create `config.json` in the same directory:
   "request_timeout_sec": 180,
   "api_key": null,
   "api_keys": [],
+  "gemini_bl": "boq_assistant-bard-web-server_20260525.09_p0",
+  "auth_user": null,
+  "xsrf_token": null,
   "cookie_file": null,
   "proxy": null,
   "log_requests": true
@@ -241,6 +267,13 @@ resp = client.chat.completions.create(
 )
 ```
 
+## Limitations
+
+- **No image/multimodal input**: Gemini's image upload requires a proprietary streaming RPC protocol (WIZ/ProcessFile) that cannot be replicated in a standard HTTP proxy. Image inputs in messages will be ignored with a note.
+- **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
+- **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
+- **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.
+
 ## Requirements
 
 - Python 3.8+
@@ -255,9 +288,19 @@ The model selection is controlled by field `[79]` in the request payload, mapped
 
 ## Acknowledgments
 
-- [linux.do](https://linux.do) community
 - Inspired by the open-source API proxy ecosystem
 
 ## License
 
 MIT
+
+---
+
+## 致谢
+
+本项目的开发 agent 能力由 [GenericAgent](https://github.com/lsdefine/GenericAgent) 提供。
+
+### 🚩 友情链接
+
+[![GenericAgent](https://img.shields.io/badge/Agent_Framework-GenericAgent-orange?style=for-the-badge&logo=github)](https://github.com/lsdefine/GenericAgent)
+[![LinuxDo](https://img.shields.io/badge/社区-LinuxDo-blue?style=for-the-badge)](https://linux.do/)

@@ -77,14 +77,25 @@ def make_sapisidhash(sapisid: str) -> str:
     return f"SAPISIDHASH {ts}_{h}"
 
 
+def _account_prefix() -> str:
+    """Return the Gemini account path prefix for non-default Google accounts."""
+    auth_user = CONFIG.get("auth_user")
+    if auth_user is None or auth_user == "":
+        return ""
+    return f"/u/{auth_user}"
+
+
 def _build_headers() -> dict:
+    account_prefix = _account_prefix()
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Origin": "https://gemini.google.com",
-        "Referer": "https://gemini.google.com/app",
+        "Referer": f"https://gemini.google.com{account_prefix}/app",
         "X-Same-Domain": "1",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
+    if account_prefix:
+        headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
     cookie_str, sapisid = load_cookie()
     if cookie_str:
         headers["Cookie"] = cookie_str
@@ -93,8 +104,8 @@ def _build_headers() -> dict:
     return headers
 
 
-def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None) -> str:
-    inner = [None] * 80
+def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
+    inner = [None] * 102
     if file_refs:
         refs = [[None, None, ref] for ref in file_refs]
         inner[0] = [prompt, 0, None, refs, None, None, 0]
@@ -116,24 +127,33 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     inner[61] = []
     inner[68] = 1
     inner[79] = model_id
+    if extra_fields:
+        for k, v in extra_fields.items():
+            inner[k] = v
     outer = [None, json.dumps(inner)]
-    return urllib.parse.urlencode({"f.req": json.dumps(outer)})
+    params = {"f.req": json.dumps(outer)}
+    if CONFIG.get("xsrf_token"):
+        params["at"] = CONFIG["xsrf_token"]
+    return urllib.parse.urlencode(params)
 
 
 def _get_url() -> str:
     reqid = int(time.time()) % 1000000
+    account_prefix = _account_prefix()
     return (
-        "https://gemini.google.com/_/BardChatUi/data/"
+        f"https://gemini.google.com{account_prefix}/_/BardChatUi/data/"
         "assistant.lamda.BardFrontendService/StreamGenerate"
         f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
     )
 
 
 def clean_text(text: str) -> str:
-    return re.sub(
+    text = re.sub(
         r'```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n.*?```\n?',
         '', text, flags=re.DOTALL
-    ).strip()
+    )
+    text = re.sub(r'http://googleusercontent\.com/card_content/\d+\n?', '', text)
+    return text.strip()
 
 
 def _extract_texts_from_line(line: str) -> list:
@@ -169,9 +189,9 @@ def extract_response_text(raw: str) -> str:
     return clean_text(last_text)
 
 
-def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None) -> str:
+def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     """Non-streaming generation with retry."""
-    body = _build_payload(prompt, model_id, think_mode, file_refs).encode()
+    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
     headers = _build_headers()
     ctx = _get_ssl_ctx()
@@ -199,15 +219,15 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     raise last_err
 
 
-def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None):
+def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
     """Streaming generation via httpx with retry on connection failure."""
     if not HAS_HTTPX:
-        text = generate(prompt, model_id, think_mode, file_refs)
+        text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         if text:
             yield text
         return
 
-    body = _build_payload(prompt, model_id, think_mode, file_refs)
+    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
     url = _get_url()
     headers = _build_headers()
     client = _get_httpx_client()

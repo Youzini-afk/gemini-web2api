@@ -120,6 +120,29 @@ SID=你的SID值; HSID=你的HSID值; SSID=你的SSID值; APISID=你的APISID值
 
 **替代方案 (浏览器扩展)**: 使用任意 "Export Cookies" 扩展导出 `gemini.google.com` 的 cookie, 然后转换为上述单行格式.
 
+### 登录账号路径与 XSRF Token
+
+如果已登录的 Gemini 页面 URL 带账号序号, 例如:
+
+```
+https://gemini.google.com/u/1/app/...
+```
+
+请把 `auth_user` 设置为该序号。登录态的 Gemini Web 请求还可能需要页面里的 XSRF token。该 token 在渲染后的 Gemini 页面源码中名为 `SNlM0e`; 在 `config.json` 中填入 `xsrf_token` 后, 服务会把它作为 `at` 表单字段提交。
+
+示例:
+
+```json
+{
+  "cookie_file": "/app/cookie.txt",
+  "auth_user": "1",
+  "xsrf_token": "AOOh0P...",
+  "gemini_bl": "boq_assistant-bard-web-server_YYYYMMDD.xx_p0"
+}
+```
+
+如果登录态请求返回 HTTP 400 且错误中包含 `xsrf`, 请刷新 Gemini Web 后更新 `xsrf_token`, 并确认 `auth_user` 与浏览器 URL 中的 `/u/<序号>/` 一致.
+
 不需要付费订阅 — 免费 Google 账号即可.
 
 ## 配置文件
@@ -135,6 +158,9 @@ SID=你的SID值; HSID=你的HSID值; SSID=你的SSID值; APISID=你的APISID值
   "request_timeout_sec": 180,
   "api_key": null,
   "api_keys": [],
+  "gemini_bl": "boq_assistant-bard-web-server_20260525.09_p0",
+  "auth_user": null,
+  "xsrf_token": null,
   "cookie_file": null,
   "proxy": null,
   "log_requests": true
@@ -223,6 +249,13 @@ python gemini_web2api.py
 ```
 
 支持 Clash, V2Ray, Shadowsocks 等任何 HTTP 代理.
+
+## 已知限制
+
+- **不支持图片/多模态输入**: Gemini 的图片上传需要专有的 WIZ streaming RPC 协议 (ProcessFile), 无法在标准 HTTP 代理中实现. 发送图片会被忽略并返回提示.
+- **Pro/Ultra 非真实路由**: 无付费订阅 cookie 时, `gemini-3.1-pro` 实际路由到 Flash 模型. "Pro" 只是 UI 偏好标签.
+- **单轮对话**: 每次请求是独立对话, 多轮上下文通过在 prompt 中包含历史消息模拟.
+- **频率限制**: Google 可能限制高频请求, server 会自动重试但持续高负载可能被封.
 
 ## 系统要求
 
