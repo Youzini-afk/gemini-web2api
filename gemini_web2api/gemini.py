@@ -179,8 +179,16 @@ def _extract_texts_from_line(line: str) -> list:
         return []
 
 
+def _raise_bard_error_if_present(raw: str):
+    """Surface upstream BardErrorInfo instead of silently returning empty text."""
+    match = re.search(r"BardErrorInfo\s*\[(\d+)\]", raw)
+    if match:
+        raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{match.group(1)}]")
+
+
 def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
+    _raise_bard_error_if_present(raw)
     last_text = ""
     for line in raw.split("\n"):
         for t in _extract_texts_from_line(line):
@@ -240,6 +248,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 buf = ""
                 for chunk in resp.iter_text():
                     buf += chunk
+                    _raise_bard_error_if_present(buf)
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         for t in _extract_texts_from_line(line):
