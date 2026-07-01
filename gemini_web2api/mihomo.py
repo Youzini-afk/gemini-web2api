@@ -228,7 +228,7 @@ def _single_node_config(raw_uri, node, mixed_port, controller_port, secret):
     return yaml.dump(config, allow_unicode=True, default_flow_style=False), ""
 
 
-def ensure_worker(raw_uri):
+def ensure_worker(raw_uri, allow_cooling=False):
     """Ensure one mihomo worker is running for raw_uri. Returns (ok, proxy_url, msg)."""
     global _last_used_raw_uri
     with _lock:
@@ -246,7 +246,9 @@ def ensure_worker(raw_uri):
                 _stop_worker_unlocked(raw_uri)
             return False, None, "node is disabled"
         h = node.get("health") or {}
-        if h.get("cooldown_until", 0) > now:
+        last_err = str(h.get("last_test_error", "")).lower()
+        hard_cooldown = h.get("last_error_type") in ("invalid_config", "proxy_start") or "config" in last_err or "mihomo worker" in last_err
+        if h.get("cooldown_until", 0) > now and (hard_cooldown or not allow_cooling):
             if worker:
                 _stop_worker_unlocked(raw_uri)
             return False, None, "node is cooling"
@@ -369,7 +371,7 @@ def get_proxy_for_request(preferred_raw_uri=None, exclude=None, attempts=8):
         if raw_uri in tried or raw_uri in exclude:
             continue
         tried.add(raw_uri)
-        ok, proxy, msg = ensure_worker(raw_uri)
+        ok, proxy, msg = ensure_worker(raw_uri, allow_cooling=True)
         if ok:
             return raw_uri, proxy, msg
         last_msg = msg

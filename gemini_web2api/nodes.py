@@ -1,13 +1,14 @@
 """Node store: persistent JSON storage for proxy nodes with thread-safe CRUD."""
 import json
 import os
+import random
 import tempfile
 import threading
 import time
 import secrets
 from typing import Optional
 
-from .config import get_data_dir
+from .config import get_data_dir, CONFIG
 
 _lock = threading.RLock()
 _node_list = []
@@ -255,13 +256,92 @@ def get_enabled_clash_proxies():
         return result
 
 
+def _node_top_k():
+    raw = os.environ.get("GEMINI_WEB2API_NODE_TOP_K") or CONFIG.get("node_top_k") or 80
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return 80
+
+
+def _health_score(h, now=None):
+    """Score a node using vertex-like health/exploration heuristics."""
+    now = now or time.time()
+    score = 100.0
+
+    success_count = int(h.get("success_count", 0) or 0)
+    fail_count = int(h.get("fail_count", 0) or 0)
+    consecutive = int(h.get("consecutive_failures", 0) or 0)
+    latency = float(h.get("last_test_latency", 0) or 0)
+    last_success = float(h.get("last_success_at", 0) or 0)
+    last_fail = float(h.get("last_fail_at", 0) or 0)
+    last_test = float(h.get("last_test_at", 0) or 0)
+
+    score += min(success_count, 100) * 3
+
+    fail_decay = 1.0
+    effective_consecutive = consecutive
+    if last_fail > 0:
+        age = now - last_fail
+        if age > 6 * 3600:
+            fail_decay = 0.15
+            effective_consecutive = 0
+        elif age > 3600:
+            fail_decay = 0.5
+    score -= min(fail_count, 100) * 4 * fail_decay
+    score -= effective_consecutive * 25
+
+    if latency > 0:
+        score -= min(latency / 1000.0, 30)
+
+    last_seen = max(last_success, last_fail, last_test)
+    if last_seen <= 0:
+        score += 30
+    else:
+        idle = now - last_seen
+        if idle > 6 * 3600:
+            score += 35
+        elif idle > 3600:
+            score += 15
+
+    return max(1.0, score)
+
+
+def _weighted_without_replacement(scored, limit):
+    """Return up to limit nodes from [(score, node)] using weighted random selection."""
+    if limit <= 0 or not scored:
+        return []
+    top_k = _node_top_k()
+    pool = sorted(scored, key=lambda item: item[0], reverse=True)[:top_k]
+    result = []
+    while pool and len(result) < limit:
+        total = sum(max(1.0, item[0]) for item in pool)
+        pick = random.uniform(0, total)
+        upto = 0.0
+        selected_idx = len(pool) - 1
+        for i, (score, _node) in enumerate(pool):
+            upto += max(1.0, score)
+            if upto >= pick:
+                selected_idx = i
+                break
+        _score, node = pool.pop(selected_idx)
+        result.append(node)
+    return result
+
+
 def select_available_clash_nodes(limit=8, exclude=None):
-    """Return enabled, non-cooling nodes with clash_config, best health first."""
+    """Return enabled Clash nodes using health-aware weighted selection.
+
+    Non-cooling nodes are selected first. Cooling nodes are only used as a
+    fallback when there are not enough non-cooling candidates to satisfy limit.
+    This hot path performs no disk writes.
+    """
     _ensure_loaded()
     exclude = set(exclude or [])
     with _lock:
         now = time.time()
-        candidates = []
+        primary = []
+        cooling = []
         for n in _node_list:
             raw_uri = n.get("raw_uri", "")
             if not raw_uri or raw_uri in exclude:
@@ -272,22 +352,34 @@ def select_available_clash_nodes(limit=8, exclude=None):
             if not clash:
                 continue
             h = _health_map.get(raw_uri, {})
-            if h.get("cooldown_until", 0) > now:
-                continue
             node = dict(n)
             node["health"] = h
-            latency = h.get("last_test_latency") or 999999
-            success_rank = 0 if h.get("success_count", 0) > 0 else 1
-            candidates.append((
-                h.get("consecutive_failures", 0),
-                h.get("fail_count", 0),
-                success_rank,
-                latency,
-                -(h.get("last_test_at", 0) or 0),
-                node,
-            ))
-        candidates.sort(key=lambda item: item[:-1])
-        return [item[-1] for item in candidates[:limit]]
+            scored = (_health_score(h, now), node)
+            if h.get("cooldown_until", 0) > now:
+                cooling.append(scored)
+            else:
+                primary.append(scored)
+
+        selected = _weighted_without_replacement(primary, limit)
+        if len(selected) < limit:
+            selected.extend(_weighted_without_replacement(cooling, limit - len(selected)))
+        return selected
+
+
+def count_available_clash_nodes(include_cooling=False):
+    """Count enabled Clash-capable nodes, optionally including cooling nodes."""
+    _ensure_loaded()
+    with _lock:
+        now = time.time()
+        count = 0
+        for n in _node_list:
+            if n.get("disabled") or not n.get("clash_config"):
+                continue
+            h = _health_map.get(n.get("raw_uri", ""), {})
+            if not include_cooling and h.get("cooldown_until", 0) > now:
+                continue
+            count += 1
+        return count
 
 
 def has_enabled_clash_nodes():
@@ -301,6 +393,9 @@ def record_health(raw_uri, success, error_type="", latency_ms=0, error_msg=""):
     """Record a health event for a node. Updates cooldown/score based on error type."""
     _ensure_loaded()
     with _lock:
+        if not success and error_type in ("client_canceled", "race_loser", "context_canceled",
+                                         "invalid_request", "safety"):
+            return
         h = _health_map.setdefault(raw_uri, {
             "success_count": 0,
             "fail_count": 0,
@@ -309,37 +404,46 @@ def record_health(raw_uri, success, error_type="", latency_ms=0, error_msg=""):
             "last_test_error": "",
             "last_test_latency": 0,
             "last_test_at": 0,
+            "last_success_at": 0,
+            "last_fail_at": 0,
+            "last_error_type": "",
         })
 
         now = time.time()
-        h["last_test_at"] = int(now)
 
         if success:
+            h["last_test_at"] = int(now)
+            h["last_success_at"] = int(now)
             h["success_count"] += 1
             h["consecutive_failures"] = 0
             h["cooldown_until"] = 0
             h["last_test_error"] = ""
+            h["last_error_type"] = ""
             if latency_ms > 0:
                 h["last_test_latency"] = latency_ms
         else:
-            # Ignored errors: true no-ops
-            if error_type in ("client_canceled", "race_loser", "context_canceled",
-                              "invalid_request", "safety"):
+            h["last_test_at"] = int(now)
+            h["last_fail_at"] = int(now)
+            if latency_ms > 0:
+                h["last_test_latency"] = latency_ms
+            if error_type == "ratelimit":
+                # Soft cooldown: do not count as a hard node failure.
+                h["last_test_error"] = error_msg or error_type
+                h["last_error_type"] = error_type
+                cf = h.get("consecutive_failures", 0) or 0
+                h["cooldown_until"] = int(now + min(30 + cf * 30, 180))
+                _save_health()
                 return
             h["fail_count"] += 1
             h["consecutive_failures"] += 1
             h["last_test_error"] = error_msg or error_type
-            if latency_ms > 0:
-                h["last_test_latency"] = latency_ms
+            h["last_error_type"] = error_type
             # Graded cooldown based on error type and consecutive failures
             cf = h["consecutive_failures"]
             if error_type == "invalid_config":
                 h["cooldown_until"] = int(now + 3600)
             elif error_type == "proxy_start":
                 h["cooldown_until"] = int(now + 300)
-            elif error_type == "ratelimit":
-                # Soft cooldown: 30-180s, no heavy penalty
-                h["cooldown_until"] = int(now + min(30 + cf * 30, 180))
             elif error_type in ("timeout", "tls", "unknown"):
                 ladder = [30, 120, 300, 900, 1800]
                 h["cooldown_until"] = int(now + ladder[min(cf - 1, len(ladder) - 1)])
