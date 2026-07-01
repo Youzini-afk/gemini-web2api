@@ -61,6 +61,23 @@ def list_subscriptions():
         return list(_subscriptions)
 
 
+def _node_uris_for_source(source_id):
+    """Return raw URIs for nodes belonging to a source without holding subscription locks."""
+    return [n.get("raw_uri", "") for n in nodes.list_nodes() if n.get("source_id") == source_id and n.get("raw_uri")]
+
+
+def _stop_source_workers(raw_uris, clear_bad=True):
+    """Stop mihomo workers for raw URIs after node mutations; never touches nodes."""
+    if not raw_uris:
+        return
+    try:
+        from . import mihomo
+        for uri in set(raw_uris):
+            mihomo.stop_worker(uri, clear_bad=clear_bad)
+    except Exception:
+        pass
+
+
 def upsert_subscription(source):
     """Create or update a subscription source. Returns the source with id."""
     _ensure_loaded()
@@ -109,13 +126,16 @@ def update_subscription(source_id, fields):
 def delete_subscription(source_id, delete_nodes=False):
     """Delete a subscription source. Optionally delete its nodes."""
     _ensure_loaded()
+    source_node_uris = _node_uris_for_source(source_id) if delete_nodes else []
     with _lock:
         before = len(_subscriptions)
         _subscriptions[:] = [s for s in _subscriptions if s.get("id") != source_id]
         if len(_subscriptions) < before:
             _save()
     if delete_nodes:
-        nodes.delete_nodes_for_source(source_id)
+        removed = nodes.delete_nodes_for_source(source_id)
+        if removed:
+            _stop_source_workers(source_node_uris, clear_bad=True)
     return len(_subscriptions) < before
 
 
@@ -141,7 +161,7 @@ def update_fetch_status(source_id, status, error, result):
         return False
 
 
-def fetch_and_save(url, name="", auto_refresh=False, refresh_interval_minutes=360, adopt_existing=True):
+def fetch_and_save(url, name="", auto_refresh=False, refresh_interval_minutes=360, adopt_existing=True, source_id=""):
     """Fetch a subscription URL, parse it, and save/replace nodes.
 
     Returns (source, result_dict, error).
@@ -159,18 +179,26 @@ def fetch_and_save(url, name="", auto_refresh=False, refresh_interval_minutes=36
             return None, None, "no nodes parsed from subscription"
 
         # Create or update source
-        source = upsert_subscription({
+        source_data = {
             "url": url,
             "name": name or url[:60],
             "auto_refresh": auto_refresh,
             "refresh_interval_minutes": refresh_interval_minutes,
-        })
+        }
+        if source_id:
+            source_data["id"] = source_id
+        source = upsert_subscription(source_data)
+        sid = source["id"]
+
+        old_uris = _node_uris_for_source(sid)
+        new_uris = [n.get("raw_uri", "") for n in parsed if n.get("raw_uri")]
 
         # Replace nodes for this source
-        result = nodes.replace_nodes_for_source(source["id"], parsed)
+        result = nodes.replace_nodes_for_source(sid, parsed)
         result["node_count"] = result.get("added", 0) + result.get("updated", 0) + result.get("adopted", 0)
 
-        update_fetch_status(source["id"], "success", "", result)
+        update_fetch_status(sid, "success", "", result)
+        _stop_source_workers(set(old_uris) | set(new_uris), clear_bad=True)
         return source, result, None
     except Exception as e:
         return None, None, str(e)
@@ -191,6 +219,7 @@ def refresh_source(source_id, adopt_existing=True):
         source.get("auto_refresh", False),
         source.get("refresh_interval_minutes", 360),
         adopt_existing,
+        source_id,
     )
 
 

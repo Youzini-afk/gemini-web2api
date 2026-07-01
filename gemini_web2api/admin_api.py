@@ -429,7 +429,7 @@ class AdminAPI:
         self._send_json({"nodes": node_list, "stats": stats})
 
     def _delete_node(self):
-        from . import nodes
+        from . import nodes, mihomo
         body = self._parse_body()
         if body is None:
             return self._send_json({"error": {"message": "invalid JSON"}}, 400)
@@ -437,6 +437,8 @@ class AdminAPI:
         if not uri:
             return self._send_json({"error": {"message": "raw_uri required"}}, 400)
         ok = nodes.delete_node(uri)
+        if ok:
+            mihomo.stop_worker(uri, clear_bad=True)
         self._send_json({"ok": ok})
 
     def _test_node(self):
@@ -452,21 +454,25 @@ class AdminAPI:
         self._send_json({"success": ok, "latency_ms": latency, "error": err})
 
     def _enable_node(self):
-        from . import nodes
+        from . import nodes, mihomo
         body = self._parse_body()
         if body is None:
             return self._send_json({"error": {"message": "invalid JSON"}}, 400)
         uri = body.get("raw_uri", "")
         ok = nodes.set_disabled(uri, False)
+        if ok:
+            mihomo.clear_bad(uri)
         self._send_json({"ok": ok})
 
     def _disable_node(self):
-        from . import nodes
+        from . import nodes, mihomo
         body = self._parse_body()
         if body is None:
             return self._send_json({"error": {"message": "invalid JSON"}}, 400)
         uri = body.get("raw_uri", "")
         ok = nodes.set_disabled(uri, True)
+        if ok:
+            mihomo.stop_worker(uri)
         self._send_json({"ok": ok})
 
     def _import_nodes(self):
@@ -485,30 +491,39 @@ class AdminAPI:
             self._send_json({"error": {"message": str(e)}}, 400)
 
     def _batch_enable(self):
-        from . import nodes
+        from . import nodes, mihomo
         body = self._parse_body()
         if body is None:
             return self._send_json({"error": {"message": "invalid JSON"}}, 400)
         uris = body.get("uris", [])
         changed = nodes.batch_set_disabled(uris, False)
+        if changed:
+            for uri in uris:
+                mihomo.clear_bad(uri)
         self._send_json({"changed": changed})
 
     def _batch_disable(self):
-        from . import nodes
+        from . import nodes, mihomo
         body = self._parse_body()
         if body is None:
             return self._send_json({"error": {"message": "invalid JSON"}}, 400)
         uris = body.get("uris", [])
         changed = nodes.batch_set_disabled(uris, True)
+        if changed:
+            for uri in uris:
+                mihomo.stop_worker(uri)
         self._send_json({"changed": changed})
 
     def _batch_delete(self):
-        from . import nodes
+        from . import nodes, mihomo
         body = self._parse_body()
         if body is None:
             return self._send_json({"error": {"message": "invalid JSON"}}, 400)
         uris = body.get("uris", [])
         removed = nodes.batch_delete(uris)
+        if removed:
+            for uri in uris:
+                mihomo.stop_worker(uri, clear_bad=True)
         self._send_json({"removed": removed})
 
     def _dedup_nodes(self):
@@ -517,8 +532,13 @@ class AdminAPI:
         self._send_json({"removed": removed})
 
     def _delete_disabled(self):
-        from . import nodes
+        from . import nodes, mihomo
+        disabled_uris = [n.get("raw_uri", "") for n in nodes.list_nodes() if n.get("disabled")]
         removed = nodes.delete_disabled()
+        if removed:
+            for uri in disabled_uris:
+                if uri:
+                    mihomo.stop_worker(uri, clear_bad=True)
         self._send_json({"removed": removed})
 
     # ─── Subscriptions ───────────────────────────────────────────────────────
