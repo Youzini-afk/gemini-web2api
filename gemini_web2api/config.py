@@ -58,12 +58,24 @@ def get_data_dir():
 
 
 def load_config(path: Optional[str] = None):
-    """Load config from JSON file and track the path for later saves."""
-    global _config_path
-    if path and os.path.exists(path):
+    """Load config from JSON file and track the path for later saves.
+
+    Container deployments often mount an empty persistent volume on first boot.
+    If GEMINI_WEB2API_CONFIG points at /app/config/config.json but that file is
+    not created yet, we still need to bind _config_path to the future file so
+    nodes.json, node_health.json, subscriptions.json, api_keys.json, and later
+    config writes all land in /app/config instead of the ephemeral fallback
+    under /root/.config/gemini-web2api.
+    """
+    global _config_path, _data_dir
+    if path:
         _config_path = path
-        with open(path) as f:
-            CONFIG.update(json.load(f))
+        _data_dir = ""
+        if os.path.exists(path):
+            with open(path) as f:
+                CONFIG.update(json.load(f))
+        else:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     return CONFIG
 
 

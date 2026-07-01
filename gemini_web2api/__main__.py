@@ -3,7 +3,7 @@ import argparse
 import os
 import threading
 
-from .config import CONFIG, load_config, find_config, load_env, ensure_admin_password
+from .config import CONFIG, load_config, find_config, load_env, ensure_admin_password, get_config_path, get_data_dir
 from .models import MODELS
 from .gemini import HAS_HTTPX
 from .server import GeminiHandler, ThreadedServer
@@ -50,6 +50,8 @@ def main():
     print(f"  Listening: http://0.0.0.0:{port}")
     print(f"  Base URL:  http://localhost:{port}/v1")
     print(f"  Admin UI:  http://localhost:{port}/admin/")
+    print(f"  Config:    {get_config_path() or 'none'}")
+    print(f"  Data dir:  {get_data_dir()}")
     print(f"  Models:    {', '.join(MODELS.keys())}")
     print(f"  Cookie:    {'yes' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
     print(f"  API Auth:  {'enabled' if (CONFIG.get('api_key') or CONFIG.get('api_keys')) else 'disabled'}")
