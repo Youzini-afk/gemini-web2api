@@ -338,6 +338,294 @@ def _hysteria2_to_uri(p):
     return base
 
 
+def _b64decode_text(value):
+    """Decode standard/url-safe base64 with forgiving padding."""
+    if not value:
+        return ""
+    s = value.strip().replace("-", "+").replace("_", "/")
+    s += "=" * (-len(s) % 4)
+    return base64.b64decode(s).decode("utf-8", errors="replace")
+
+
+def _to_int(value, default=0):
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return default
+
+
+def _truthy(value):
+    return str(value).lower() in ("1", "true", "yes", "y")
+
+
+def _first(params, *names, default=""):
+    for name in names:
+        if name in params and params[name]:
+            return params[name][0]
+    return default
+
+
+def _query_dict(query):
+    return urllib.parse.parse_qs(query, keep_blank_values=True)
+
+
+def _split_alpn(value):
+    if not value:
+        return None
+    parts = [p.strip() for p in str(value).split(",") if p.strip()]
+    return parts if len(parts) > 1 else (parts[0] if parts else None)
+
+
+def _parse_plugin(plugin_value):
+    if not plugin_value:
+        return "", {}
+    value = urllib.parse.unquote(plugin_value)
+    parts = [p for p in value.split(";") if p]
+    if not parts:
+        return "", {}
+    opts = {}
+    for part in parts[1:]:
+        if "=" in part:
+            k, v = part.split("=", 1)
+            opts[k] = v
+    return parts[0], opts
+
+
+def _parse_host_port(text):
+    """Parse host:port, including bracketed IPv6."""
+    text = text.strip()
+    if text.startswith("[") and "]" in text:
+        host, rest = text[1:].split("]", 1)
+        if rest.startswith(":"):
+            return host, _to_int(rest[1:])
+        return host, 0
+    if ":" not in text:
+        return text, 0
+    host, port = text.rsplit(":", 1)
+    return host, _to_int(port)
+
+
+def _parse_ss_uri(uri, name):
+    raw = uri[len("ss://"):]
+    raw_no_frag = raw.split("#", 1)[0]
+    query = ""
+    if "?" in raw_no_frag:
+        raw_no_frag, query = raw_no_frag.split("?", 1)
+
+    method = password = server = ""
+    port = 0
+    if "@" in raw_no_frag:
+        userinfo, hostport = raw_no_frag.rsplit("@", 1)
+        userinfo = urllib.parse.unquote(userinfo)
+        if ":" not in userinfo:
+            try:
+                userinfo = _b64decode_text(userinfo)
+            except Exception:
+                pass
+        if ":" not in userinfo:
+            raise ValueError("ss URI missing method/password")
+        method, password = userinfo.split(":", 1)
+        server, port = _parse_host_port(hostport)
+    else:
+        decoded = _b64decode_text(raw_no_frag)
+        if "@" not in decoded:
+            raise ValueError("ss full-base64 URI missing server")
+        userinfo, hostport = decoded.rsplit("@", 1)
+        if ":" not in userinfo:
+            raise ValueError("ss URI missing method/password")
+        method, password = userinfo.split(":", 1)
+        server, port = _parse_host_port(hostport)
+
+    if not method or not password or not server or not port:
+        raise ValueError("ss URI missing required fields")
+    cfg = {"name": name or server, "type": "ss", "server": server, "port": port, "cipher": method, "password": password}
+    params = _query_dict(query)
+    plugin, plugin_opts = _parse_plugin(_first(params, "plugin"))
+    if plugin:
+        cfg["plugin"] = plugin
+        if plugin_opts:
+            cfg["plugin-opts"] = plugin_opts
+    return cfg
+
+
+def _parse_vmess_uri(uri, name):
+    payload = uri[len("vmess://"):].split("#", 1)[0]
+    data = json.loads(_b64decode_text(payload))
+    server = data.get("add") or data.get("server") or ""
+    port = _to_int(data.get("port"))
+    uuid = data.get("id") or data.get("uuid") or ""
+    if not server or not port or not uuid:
+        raise ValueError("vmess URI missing required fields")
+    cfg = {
+        "name": name or data.get("ps") or server,
+        "type": "vmess",
+        "server": server,
+        "port": port,
+        "uuid": uuid,
+        "alterId": _to_int(data.get("aid", data.get("alterId", 0))),
+        "cipher": data.get("scy") or data.get("cipher") or "auto",
+    }
+    if str(data.get("tls", "")).lower() in ("tls", "true", "1"):
+        cfg["tls"] = True
+    sni = data.get("sni") or data.get("servername") or data.get("host")
+    if sni:
+        cfg["servername"] = sni
+    if _truthy(data.get("allowInsecure")):
+        cfg["skip-cert-verify"] = True
+    net = data.get("net") or data.get("network") or "tcp"
+    if net and net != "tcp":
+        cfg["network"] = net
+    if net == "ws":
+        ws = {}
+        if data.get("path"):
+            ws["path"] = data["path"]
+        if data.get("host"):
+            ws["headers"] = {"Host": data["host"]}
+        if ws:
+            cfg["ws-opts"] = ws
+    elif net == "grpc":
+        service = data.get("path") or data.get("serviceName") or data.get("serviceName")
+        if service:
+            cfg["grpc-opts"] = {"grpc-service-name": service}
+    elif net == "http":
+        http_opts = {}
+        if data.get("path"):
+            http_opts["path"] = [data["path"]] if isinstance(data["path"], str) else data["path"]
+        if data.get("host"):
+            http_opts["headers"] = {"Host": [data["host"]] if isinstance(data["host"], str) else data["host"]}
+        if http_opts:
+            cfg["http-opts"] = http_opts
+    return cfg
+
+
+def _apply_transport_opts(cfg, params):
+    net = _first(params, "type", "network", default="tcp") or "tcp"
+    if net and net != "tcp":
+        cfg["network"] = net
+    if net == "ws":
+        ws = {}
+        path = _first(params, "path")
+        host = _first(params, "host", "Host")
+        if path:
+            ws["path"] = path
+        if host:
+            ws["headers"] = {"Host": host}
+        if ws:
+            cfg["ws-opts"] = ws
+    elif net == "grpc":
+        service = _first(params, "serviceName", "service-name", "grpc-service-name")
+        if service:
+            cfg["grpc-opts"] = {"grpc-service-name": service}
+
+
+def _parse_vless_uri(uri, name):
+    parsed = urllib.parse.urlsplit(uri)
+    params = _query_dict(parsed.query)
+    uuid = urllib.parse.unquote(parsed.username or "")
+    server = parsed.hostname or ""
+    port = parsed.port or 0
+    if not uuid or not server or not port:
+        raise ValueError("vless URI missing required fields")
+    cfg = {"name": name or server, "type": "vless", "server": server, "port": port, "uuid": uuid}
+    security = _first(params, "security")
+    if security in ("tls", "reality"):
+        cfg["tls"] = True
+    sni = _first(params, "sni", "servername", "peer")
+    if sni:
+        cfg["servername"] = sni
+    fp = _first(params, "fp", "fingerprint", "client-fingerprint")
+    if fp:
+        cfg["client-fingerprint"] = fp
+    flow = _first(params, "flow")
+    if flow:
+        cfg["flow"] = flow
+    if security == "reality":
+        reality = {}
+        pbk = _first(params, "pbk", "public-key")
+        sid = _first(params, "sid", "short-id")
+        if pbk:
+            reality["public-key"] = pbk
+        if sid:
+            reality["short-id"] = sid
+        if reality:
+            cfg["reality-opts"] = reality
+    if _truthy(_first(params, "allowInsecure", "insecure", "skip-cert-verify")):
+        cfg["skip-cert-verify"] = True
+    _apply_transport_opts(cfg, params)
+    return cfg
+
+
+def _parse_trojan_uri(uri, name):
+    parsed = urllib.parse.urlsplit(uri)
+    params = _query_dict(parsed.query)
+    password = urllib.parse.unquote(parsed.username or "")
+    server = parsed.hostname or ""
+    port = parsed.port or 0
+    if not password or not server or not port:
+        raise ValueError("trojan URI missing required fields")
+    cfg = {"name": name or server, "type": "trojan", "server": server, "port": port, "password": password}
+    sni = _first(params, "sni", "servername", "peer")
+    if sni:
+        cfg["sni"] = sni
+    fp = _first(params, "fp", "fingerprint", "client-fingerprint")
+    if fp:
+        cfg["client-fingerprint"] = fp
+    alpn = _split_alpn(_first(params, "alpn"))
+    if alpn:
+        cfg["alpn"] = alpn
+    if _truthy(_first(params, "allowInsecure", "insecure", "skip-cert-verify")):
+        cfg["skip-cert-verify"] = True
+    _apply_transport_opts(cfg, params)
+    return cfg
+
+
+def _parse_hysteria2_uri(uri, name):
+    parsed = urllib.parse.urlsplit(uri)
+    params = _query_dict(parsed.query)
+    password = urllib.parse.unquote(parsed.username or "")
+    server = parsed.hostname or ""
+    port = parsed.port or 0
+    if not password or not server or not port:
+        raise ValueError("hysteria2 URI missing required fields")
+    cfg = {"name": name or server, "type": "hysteria2", "server": server, "port": port, "password": password}
+    sni = _first(params, "sni", "servername", "peer")
+    if sni:
+        cfg["sni"] = sni
+    mport = _first(params, "mport", "ports")
+    if mport:
+        cfg["ports"] = mport
+    obfs = _first(params, "obfs")
+    if obfs:
+        cfg["obfs"] = obfs
+    obfs_password = _first(params, "obfs-password", "obfs_password")
+    if obfs_password:
+        cfg["obfs-password"] = obfs_password
+    fp = _first(params, "fp", "fingerprint", "client-fingerprint")
+    if fp:
+        cfg["client-fingerprint"] = fp
+    alpn = _split_alpn(_first(params, "alpn"))
+    if alpn:
+        cfg["alpn"] = alpn
+    if _truthy(_first(params, "insecure", "allowInsecure", "skip-cert-verify")):
+        cfg["skip-cert-verify"] = True
+    return cfg
+
+
+def uri_to_clash_config(uri, protocol, name=""):
+    """Convert one supported URI to a Mihomo proxy dict, or raise ValueError."""
+    if protocol == "ss":
+        return _parse_ss_uri(uri, name)
+    if protocol == "vmess":
+        return _parse_vmess_uri(uri, name)
+    if protocol == "vless":
+        return _parse_vless_uri(uri, name)
+    if protocol == "trojan":
+        return _parse_trojan_uri(uri, name)
+    if protocol in ("hysteria2", "hy2"):
+        return _parse_hysteria2_uri(uri, name)
+    raise ValueError(f"unsupported protocol: {protocol}")
+
+
 def parse_uri_lines(text):
     """Parse one-URI-per-line text into node list."""
     result = []
@@ -360,10 +648,21 @@ def parse_uri_lines(text):
         if protocol == "hy2":
             protocol = "hysteria2"
 
-        result.append({
+        clash_config = None
+        import_error = ""
+        try:
+            clash_config = uri_to_clash_config(line, protocol, name)
+            name = clash_config.get("name") or name
+        except Exception as e:
+            import_error = str(e)
+
+        node = {
             "raw_uri": line,
             "name": name,
             "protocol": protocol,
-            "clash_config": None,  # No Clash config for URI-only nodes
-        })
+            "clash_config": clash_config,
+        }
+        if import_error:
+            node["import_error"] = import_error
+        result.append(node)
     return result
