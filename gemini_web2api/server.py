@@ -14,6 +14,8 @@ from .gemini import generate, generate_stream, log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import upload_image, fetch_image_bytes
 from . import __version__
+from . import admin_api
+from . import admin_assets
 
 
 def _usage(prompt: str, text: str) -> dict:
@@ -72,12 +74,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return None
 
     def _authorized(self):
-        keys = []
-        value = CONFIG.get("api_keys") or CONFIG.get("api_key")
-        if isinstance(value, str):
-            keys = [key.strip() for key in value.split(",") if key.strip()]
-        elif isinstance(value, list):
-            keys = [str(key).strip() for key in value if str(key).strip()]
+        # Check both named key store and config-based keys
+        keys = admin_api.get_all_key_values()
         if not keys:
             return True
         auth = self.headers.get("Authorization", "").strip()
@@ -104,6 +102,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             path = urllib.parse.urlparse(self.path).path
+            # Admin pages and API — handled separately from API key auth
+            if admin_api.is_admin_api_path(path):
+                admin_api.AdminAPI(self).handle()
+                return
+            if admin_api.is_admin_page_path(path):
+                admin_assets.serve_admin_page(self)
+                return
             if self._requires_auth() and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
@@ -129,6 +134,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             path = urllib.parse.urlparse(self.path).path
+            # Admin API — handled separately from API key auth
+            if admin_api.is_admin_api_path(path):
+                admin_api.AdminAPI(self).handle()
+                return
+            if admin_api.is_admin_page_path(path):
+                self.send_json({"error": "method not allowed"}, 405)
+                return
             if self._requires_auth() and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
@@ -148,6 +160,38 @@ class GeminiHandler(BaseHTTPRequestHandler):
             pass
         except Exception as e:
             log(f"POST error: {e}")
+            try:
+                self.send_json({"error": {"message": str(e)}}, 500)
+            except:
+                pass
+
+    def do_PUT(self):
+        try:
+            path = urllib.parse.urlparse(self.path).path
+            if admin_api.is_admin_api_path(path):
+                admin_api.AdminAPI(self).handle()
+                return
+            self.send_json({"error": "not found"}, 404)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log(f"PUT error: {e}")
+            try:
+                self.send_json({"error": {"message": str(e)}}, 500)
+            except:
+                pass
+
+    def do_DELETE(self):
+        try:
+            path = urllib.parse.urlparse(self.path).path
+            if admin_api.is_admin_api_path(path):
+                admin_api.AdminAPI(self).handle()
+                return
+            self.send_json({"error": "not found"}, 404)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log(f"DELETE error: {e}")
             try:
                 self.send_json({"error": {"message": str(e)}}, 500)
             except:

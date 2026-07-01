@@ -1,11 +1,13 @@
 """Entry point: python -m gemini_web2api"""
 import argparse
 import os
+import threading
 
-from .config import CONFIG, load_config, find_config, load_env
+from .config import CONFIG, load_config, find_config, load_env, ensure_admin_password
 from .models import MODELS
 from .gemini import HAS_HTTPX
 from .server import GeminiHandler, ThreadedServer
+from . import admin_session
 from . import __version__
 
 
@@ -30,11 +32,24 @@ def main():
     if args.proxy:
         CONFIG["proxy"] = args.proxy
 
+    # Ensure admin password exists (auto-generate + persist if missing)
+    ensure_admin_password()
+
+    # Start admin session cleanup timer (hourly)
+    def _cleanup_loop():
+        import time
+        while True:
+            time.sleep(3600)
+            admin_session.cleanup_expired()
+    t = threading.Thread(target=_cleanup_loop, daemon=True)
+    t.start()
+
     port = CONFIG["port"]
     server = ThreadedServer((CONFIG["host"], port), GeminiHandler)
     print(f"gemini-web2api v{__version__}")
     print(f"  Listening: http://0.0.0.0:{port}")
     print(f"  Base URL:  http://localhost:{port}/v1")
+    print(f"  Admin UI:  http://localhost:{port}/admin/")
     print(f"  Models:    {', '.join(MODELS.keys())}")
     print(f"  Cookie:    {'yes' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
     print(f"  API Auth:  {'enabled' if (CONFIG.get('api_key') or CONFIG.get('api_keys')) else 'disabled'}")

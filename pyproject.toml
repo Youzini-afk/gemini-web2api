@@ -9,6 +9,7 @@ dependencies = []
 
 [project.optional-dependencies]
 streaming = ["httpx>=0.25"]
+admin = ["pyyaml>=6.0"]
 
 [project.scripts]
 gemini-web2api = "gemini_web2api.__main__:main"
@@ -16,3 +17,9 @@ gemini-web2api = "gemini_web2api.__main__:main"
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["gemini_web2api*"]
+
+[tool.setuptools.package-data]
+gemini_web2api = ["admin/**/*"]

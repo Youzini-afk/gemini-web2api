@@ -3,6 +3,9 @@ __pycache__/
 config.json
 cookie.txt
 cookie.json
+api_keys.json
 .env
+.slim/
 .idea
 .DS_Store
+.slim/deepwork/

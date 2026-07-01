@@ -20,6 +20,7 @@ from .config import CONFIG
 _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
 _httpx_client = None
+_httpx_client_proxy = None
 
 
 def log(msg: str):
@@ -37,11 +38,33 @@ def _get_ssl_ctx():
 
 
 def _get_httpx_client():
-    global _httpx_client
-    if _httpx_client is None and HAS_HTTPX:
+    """Return an httpx client, rebuilding it when the effective proxy changes.
+
+    This is critical: if the proxy changes (e.g. mihomo node pool starts/stops),
+    the cached client must be rebuilt to pick up the new proxy. Without this,
+    streaming requests would silently keep using the old proxy.
+    """
+    global _httpx_client, _httpx_client_proxy
+    # Delegate to config.get_effective_proxy if available (supports mihomo),
+    # otherwise fall back to CONFIG["proxy"].
+    try:
+        from .config import get_effective_proxy
+        proxy = get_effective_proxy()
+    except Exception:
         proxy = CONFIG.get("proxy")
+    if _httpx_client is None and HAS_HTTPX:
         transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
         _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
+        _httpx_client_proxy = proxy
+    elif _httpx_client is not None and proxy != _httpx_client_proxy:
+        # Proxy changed — rebuild client
+        try:
+            _httpx_client.close()
+        except Exception:
+            pass
+        transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
+        _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
+        _httpx_client_proxy = proxy
     return _httpx_client
 
 

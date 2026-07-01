@@ -10,6 +10,7 @@
   "default_model": "gemini-3.5-flash",
   "api_key": null,
   "api_keys": [],
+  "admin_password": null,
   "cookie_file": null,
   "proxy": null,
   "log_requests": true
