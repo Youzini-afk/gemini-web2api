@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Gemini Web2API · 控制台</title>
-  <link rel="stylesheet" href="admin.css?v=webui-3" />
+  <link rel="stylesheet" href="admin.css?v=webui-4" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Roboto+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -245,11 +245,47 @@
             </div>
           </div>
 
-          <!-- Import box -->
+          <!-- Subscription sync (add/update source) -->
           <div class="card">
-            <div class="card-head"><h2 class="card-title">导入节点</h2></div>
-            <p class="muted">粘贴 Clash YAML、订阅链接或节点 URI (每行一个)</p>
-            <textarea id="import-text" class="import-textarea" rows="6" placeholder="proxies:&#10;  - name: ...&#10;  - type: ss ...&#10;或 https://example.com/sub.yaml&#10;或 ss://...&#10;或 vmess://..."></textarea>
+            <div class="card-head">
+              <h2 class="card-title">订阅源同步</h2>
+              <span class="card-sub">添加或更新订阅源并立即拉取</span>
+            </div>
+            <form id="sub-sync-form" class="sub-form form-grid" autocomplete="off">
+              <label class="field field-full">
+                <span class="field-label">订阅 URL *</span>
+                <input type="url" id="sub-url-input" placeholder="https://example.com/sub.yaml" required />
+              </label>
+              <label class="field">
+                <span class="field-label">源名称 (可选)</span>
+                <input type="text" id="sub-name-input" placeholder="my-provider" />
+              </label>
+              <label class="field">
+                <span class="field-label">刷新间隔 (分钟)</span>
+                <input type="number" id="sub-refresh-interval-input" min="10" max="10080" value="360" />
+              </label>
+              <label class="field field-toggle sub-auto-field">
+                <span class="field-label">自动定时刷新</span>
+                <label class="switch">
+                  <input type="checkbox" id="sub-auto-refresh-input" checked />
+                  <span class="slider"></span>
+                </label>
+              </label>
+              <div class="form-actions sub-form-actions">
+                <button type="submit" class="btn btn-primary" id="sub-save-refresh-btn">保存并拉取</button>
+                <span class="muted" id="sub-save-result"></span>
+              </div>
+            </form>
+          </div>
+
+          <!-- Manual import box (pasted YAML / URI only) -->
+          <div class="card">
+            <div class="card-head">
+              <h2 class="card-title">手动导入节点</h2>
+              <span class="card-sub">粘贴内容，非订阅源管理</span>
+            </div>
+            <p class="muted">粘贴 Clash YAML 配置或节点 URI (每行一个)。如需添加订阅源，请使用上方“订阅源同步”。</p>
+            <textarea id="import-text" class="import-textarea" rows="6" placeholder="proxies:&#10;  - name: ...&#10;  - type: ss ...&#10;或 ss://...&#10;或 vmess://...&#10;或 trojan://..."></textarea>
             <div class="form-actions">
               <button class="btn btn-primary" id="import-btn">导入</button>
               <span class="muted" id="import-result"></span>
@@ -301,14 +337,14 @@
   <div id="toast-container" class="toast-container"></div>
 
   <!-- Scripts (load order matters) -->
-  <script src="utils.js?v=webui-4"></script>
-  <script src="api.js?v=webui-4"></script>
-  <script src="page-overview.js?v=webui-4"></script>
-  <script src="page-settings.js?v=webui-4"></script>
-  <script src="page-keys.js?v=webui-4"></script>
-  <script src="page-models.js?v=webui-4"></script>
-  <script src="page-nodes.js?v=webui-4"></script>
-  <script src="page-appearance.js?v=webui-4"></script>
-  <script src="admin.js?v=webui-4"></script>
+  <script src="utils.js?v=webui-5"></script>
+  <script src="api.js?v=webui-5"></script>
+  <script src="page-overview.js?v=webui-5"></script>
+  <script src="page-settings.js?v=webui-5"></script>
+  <script src="page-keys.js?v=webui-5"></script>
+  <script src="page-models.js?v=webui-5"></script>
+  <script src="page-nodes.js?v=webui-5"></script>
+  <script src="page-appearance.js?v=webui-5"></script>
+  <script src="admin.js?v=webui-5"></script>
 </body>
 </html>

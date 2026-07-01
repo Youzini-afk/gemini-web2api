@@ -225,39 +225,66 @@ function initNodesPage() {
     }).catch(function (e) { toast('重启失败: ' + e.message, 'err'); });
   };
 
-  // Import
+  // Manual import (pasted Clash YAML / node URI only — NOT subscription URLs,
+  // which are managed in the dedicated 订阅源同步 card above).
   var importBtn = document.getElementById('import-btn');
   if (importBtn) importBtn.onclick = function () {
     var text = (document.getElementById('import-text') || {}).value || '';
     if (!text.trim()) return toast('请粘贴内容', 'warn');
     var resultEl = document.getElementById('import-result');
     if (resultEl) resultEl.textContent = '导入中...';
-    // Detect URL
-    if (text.trim().startsWith('http://') || text.trim().startsWith('https://')) {
-      api.fetchSubscription({
-        url: text.trim(),
-        name: '',
-        auto_refresh: false,
-        refresh_interval_minutes: 360,
-        adopt_existing: true
-      }).then(function (r) {
-        toast('订阅导入成功', 'ok');
-        if (resultEl) resultEl.textContent = '新增 ' + (r.result.added || 0) + ' / 更新 ' + (r.result.updated || 0) + ' / 认领 ' + (r.result.adopted || 0);
-        loadNodes(); loadSubscriptions();
-      }).catch(function (e) {
-        toast('订阅导入失败: ' + e.message, 'err');
-        if (resultEl) resultEl.textContent = '失败: ' + e.message;
-      });
-    } else {
-      api.importNodes(text).then(function (r) {
-        toast('导入完成: 新增 ' + r.added + ', 跳过 ' + r.skipped, 'ok');
-        if (resultEl) resultEl.textContent = '新增 ' + r.added + ', 跳过 ' + r.skipped;
-        loadNodes();
-      }).catch(function (e) {
-        toast('导入失败: ' + e.message, 'err');
-        if (resultEl) resultEl.textContent = '失败: ' + e.message;
-      });
-    }
+    api.importNodes(text).then(function (r) {
+      toast('导入完成: 新增 ' + r.added + ', 跳过 ' + r.skipped, 'ok');
+      if (resultEl) resultEl.textContent = '新增 ' + r.added + ', 跳过 ' + r.skipped;
+      loadNodes();
+    }).catch(function (e) {
+      toast('导入失败: ' + e.message, 'err');
+      if (resultEl) resultEl.textContent = '失败: ' + e.message;
+    });
+  };
+
+  // Subscription source sync form (add/update source + fetch)
+  var subForm = document.getElementById('sub-sync-form');
+  if (subForm) subForm.onsubmit = function (e) {
+    e.preventDefault();
+    var urlInput = document.getElementById('sub-url-input');
+    var nameInput = document.getElementById('sub-name-input');
+    var autoInput = document.getElementById('sub-auto-refresh-input');
+    var intervalInput = document.getElementById('sub-refresh-interval-input');
+    var btn = document.getElementById('sub-save-refresh-btn');
+    var resultEl = document.getElementById('sub-save-result');
+    if (!urlInput) return;
+    var url = (urlInput.value || '').trim();
+    if (!url) return toast('请输入订阅 URL', 'warn');
+    if (!/^https?:\/\//i.test(url)) return toast('URL 须以 http:// 或 https:// 开头', 'warn');
+    var name = (nameInput && nameInput.value || '').trim();
+    var autoRefresh = !!(autoInput && autoInput.checked);
+    var interval = parseInt((intervalInput && intervalInput.value) || '360', 10);
+    if (isNaN(interval) || interval < 10) interval = 10;
+    if (interval > 10080) interval = 10080;
+    if (btn) btn.disabled = true;
+    if (resultEl) resultEl.textContent = '拉取中...';
+    api.fetchSubscription({
+      url: url,
+      name: name,
+      auto_refresh: autoRefresh,
+      refresh_interval_minutes: interval,
+      adopt_existing: true
+    }).then(function (r) {
+      var added = (r.result && r.result.added) || 0;
+      var updated = (r.result && r.result.updated) || 0;
+      var adopted = (r.result && r.result.adopted) || 0;
+      toast('订阅拉取成功', 'ok');
+      if (resultEl) resultEl.textContent = '新增 ' + added + ' / 更新 ' + updated + ' / 认领 ' + adopted;
+      // Reset for next add but keep URL for convenience
+      if (nameInput) nameInput.value = '';
+      loadNodes(); loadSubscriptions();
+    }).catch(function (e) {
+      toast('订阅拉取失败: ' + e.message, 'err');
+      if (resultEl) resultEl.textContent = '失败: ' + e.message;
+    }).then(function () {
+      if (btn) btn.disabled = false;
+    });
   };
 
   // Search
