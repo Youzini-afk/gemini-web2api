@@ -131,6 +131,75 @@
     },
     putModels: function (payload) {
       return request('/models', { method: 'PUT', body: payload || {} }).then(function (r) { return r.data; });
+    },
+
+    // ─── Nodes ───────────────────────────────────────────────────
+    getNodes: function () {
+      return request('/nodes').then(function (r) { return r.data; });
+    },
+    deleteNode: function (rawUri) {
+      return request('/nodes', { method: 'DELETE', body: { raw_uri: rawUri } }).then(function (r) { return r.data; });
+    },
+    testNode: function (rawUri, timeoutSec) {
+      return request('/nodes/test', { method: 'POST', body: { raw_uri: rawUri, timeout_seconds: timeoutSec || 10 } }).then(function (r) { return r.data; });
+    },
+    enableNode: function (rawUri) {
+      return request('/nodes/enable', { method: 'POST', body: { raw_uri: rawUri } }).then(function (r) { return r.data; });
+    },
+    disableNode: function (rawUri) {
+      return request('/nodes/disable', { method: 'POST', body: { raw_uri: rawUri } }).then(function (r) { return r.data; });
+    },
+    importNodes: function (text) {
+      return request('/nodes/import', { method: 'POST', body: { text: text } }).then(function (r) { return r.data; });
+    },
+    batchEnable: function (uris) {
+      return request('/nodes/batch-enable', { method: 'POST', body: { uris: uris } }).then(function (r) { return r.data; });
+    },
+    batchDisable: function (uris) {
+      return request('/nodes/batch-disable', { method: 'POST', body: { uris: uris } }).then(function (r) { return r.data; });
+    },
+    batchDelete: function (uris) {
+      return request('/nodes/batch-delete', { method: 'POST', body: { uris: uris } }).then(function (r) { return r.data; });
+    },
+    dedupNodes: function () {
+      return request('/nodes/dedup', { method: 'POST' }).then(function (r) { return r.data; });
+    },
+    deleteDisabledNodes: function () {
+      return request('/nodes/disabled', { method: 'DELETE' }).then(function (r) { return r.data; });
+    },
+
+    // ─── Subscriptions ──────────────────────────────────────────
+    getSubscriptions: function () {
+      return request('/subscriptions').then(function (r) { return r.data; });
+    },
+    fetchSubscription: function (payload) {
+      return request('/subscriptions/fetch', { method: 'POST', body: payload }).then(function (r) { return r.data; });
+    },
+    refreshSubscription: function (id) {
+      return request('/subscriptions/refresh', { method: 'POST', body: { id: id } }).then(function (r) { return r.data; });
+    },
+    refreshAllSubscriptions: function () {
+      return request('/subscriptions/refresh-all', { method: 'POST' }).then(function (r) { return r.data; });
+    },
+    updateSubscription: function (payload) {
+      return request('/subscriptions', { method: 'PUT', body: payload }).then(function (r) { return r.data; });
+    },
+    deleteSubscription: function (id, deleteNodes) {
+      return request('/subscriptions', { method: 'DELETE', body: { id: id, delete_nodes: deleteNodes } }).then(function (r) { return r.data; });
+    },
+
+    // ─── Mihomo ─────────────────────────────────────────────────
+    getMihomoStatus: function () {
+      return request('/mihomo/status').then(function (r) { return r.data; });
+    },
+    startMihomo: function () {
+      return request('/mihomo/start', { method: 'POST' }).then(function (r) { return r.data; });
+    },
+    stopMihomo: function () {
+      return request('/mihomo/stop', { method: 'POST' }).then(function (r) { return r.data; });
+    },
+    switchMihomo: function (rawUri) {
+      return request('/mihomo/switch', { method: 'POST', body: { raw_uri: rawUri } }).then(function (r) { return r.data; });
     }
   };
 

@@ -58,6 +58,9 @@
         <a href="#/models" class="nav-item" data-route="models">
           <span class="nav-icon">🧠</span><span class="nav-label">模型</span>
         </a>
+        <a href="#/nodes" class="nav-item" data-route="nodes">
+          <span class="nav-icon">🌐</span><span class="nav-label">节点</span>
+        </a>
         <a href="#/appearance" class="nav-item" data-route="appearance">
           <span class="nav-icon">🎨</span><span class="nav-label">外观</span>
         </a>
@@ -228,6 +231,65 @@
             </div>
           </div>
         </section>
+
+        <!-- Nodes -->
+        <section id="page-nodes" class="page hidden">
+          <!-- Mihomo status -->
+          <div class="card" id="mihomo-card">
+            <div class="card-head"><h2 class="card-title">代理引擎</h2><span class="card-sub" id="mihomo-status-text">检测中...</span></div>
+            <div class="form-actions">
+              <button class="btn btn-primary" id="mihomo-start-btn">启动</button>
+              <button class="btn btn-ghost" id="mihomo-stop-btn">停止</button>
+              <button class="btn btn-ghost" id="mihomo-restart-btn">重启</button>
+              <span class="muted" id="mihomo-info"></span>
+            </div>
+          </div>
+
+          <!-- Import box -->
+          <div class="card">
+            <div class="card-head"><h2 class="card-title">导入节点</h2></div>
+            <p class="muted">粘贴 Clash YAML、订阅链接或节点 URI (每行一个)</p>
+            <textarea id="import-text" rows="6" placeholder="proxies:&#10;  - name: ...&#10;  - type: ss ...&#10;或 https://example.com/sub.yaml&#10;或 ss://...&#10;或 vmess://..."></textarea>
+            <div class="form-actions">
+              <button class="btn btn-primary" id="import-btn">导入</button>
+              <span class="muted" id="import-result"></span>
+            </div>
+          </div>
+
+          <!-- Subscription sources -->
+          <div class="card">
+            <div class="card-head"><h2 class="card-title">订阅源</h2><span class="card-sub" id="sub-count"></span></div>
+            <div id="subscriptions-list"></div>
+          </div>
+
+          <!-- Node pool overview -->
+          <div class="card">
+            <div class="card-head"><h2 class="card-title">节点池</h2><span class="card-sub" id="node-stats-text"></span></div>
+            <div class="chip-row" id="node-chips"></div>
+          </div>
+
+          <!-- Node list -->
+          <div class="card">
+            <div class="card-head">
+              <h2 class="card-title">节点列表</h2>
+              <input type="text" id="node-search" placeholder="搜索节点名/地址/协议..." class="search-input" />
+            </div>
+            <div class="form-actions node-batch">
+              <button class="btn btn-ghost" id="node-dedup-btn">去重</button>
+              <button class="btn btn-ghost" id="node-del-disabled-btn">删除已禁用</button>
+              <button class="btn btn-ghost" id="node-batch-enable-btn">批量启用</button>
+              <button class="btn btn-ghost" id="node-batch-disable-btn">批量禁用</button>
+              <button class="btn btn-ghost" id="node-batch-delete-btn">批量删除</button>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table" id="nodes-table">
+                <thead><tr><th><input type="checkbox" id="node-select-all" /></th><th>名称</th><th>协议</th><th>地址</th><th>状态</th><th>延迟</th><th>来源</th><th></th></tr></thead>
+                <tbody id="nodes-tbody"></tbody>
+              </table>
+            </div>
+            <div class="pagination" id="node-pagination"></div>
+          </div>
+        </section>
       </div>
     </main>
   </div>
@@ -239,13 +301,14 @@
   <div id="toast-container" class="toast-container"></div>
 
   <!-- Scripts (load order matters) -->
-  <script src="utils.js?v=webui-1"></script>
-  <script src="api.js?v=webui-1"></script>
-  <script src="page-overview.js?v=webui-1"></script>
-  <script src="page-settings.js?v=webui-1"></script>
-  <script src="page-keys.js?v=webui-1"></script>
-  <script src="page-models.js?v=webui-1"></script>
-  <script src="page-appearance.js?v=webui-1"></script>
-  <script src="admin.js?v=webui-1"></script>
+  <script src="utils.js?v=webui-2"></script>
+  <script src="api.js?v=webui-2"></script>
+  <script src="page-overview.js?v=webui-2"></script>
+  <script src="page-settings.js?v=webui-2"></script>
+  <script src="page-keys.js?v=webui-2"></script>
+  <script src="page-models.js?v=webui-2"></script>
+  <script src="page-nodes.js?v=webui-2"></script>
+  <script src="page-appearance.js?v=webui-2"></script>
+  <script src="admin.js?v=webui-2"></script>
 </body>
 </html>

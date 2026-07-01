@@ -253,6 +253,53 @@ class AdminAPI:
             return self._get_models()
         elif path == "/api/admin/models" and method == "PUT":
             return self._put_models()
+        # Nodes
+        elif path == "/api/admin/nodes" and method == "GET":
+            return self._get_nodes()
+        elif path == "/api/admin/nodes" and method == "DELETE":
+            return self._delete_node()
+        elif path == "/api/admin/nodes/test" and method == "POST":
+            return self._test_node()
+        elif path == "/api/admin/nodes/enable" and method == "POST":
+            return self._enable_node()
+        elif path == "/api/admin/nodes/disable" and method == "POST":
+            return self._disable_node()
+        elif path == "/api/admin/nodes/import" and method == "POST":
+            return self._import_nodes()
+        elif path == "/api/admin/nodes/batch-enable" and method == "POST":
+            return self._batch_enable()
+        elif path == "/api/admin/nodes/batch-disable" and method == "POST":
+            return self._batch_disable()
+        elif path == "/api/admin/nodes/batch-delete" and method == "POST":
+            return self._batch_delete()
+        elif path == "/api/admin/nodes/dedup" and method == "POST":
+            return self._dedup_nodes()
+        elif path == "/api/admin/nodes/disabled" and method == "DELETE":
+            return self._delete_disabled()
+        # Subscriptions
+        elif path == "/api/admin/subscriptions" and method == "GET":
+            return self._get_subscriptions()
+        elif path == "/api/admin/subscriptions" and method == "POST":
+            return self._add_subscription()
+        elif path == "/api/admin/subscriptions" and method == "PUT":
+            return self._update_subscription()
+        elif path == "/api/admin/subscriptions" and method == "DELETE":
+            return self._delete_subscription()
+        elif path == "/api/admin/subscriptions/fetch" and method == "POST":
+            return self._fetch_subscription()
+        elif path == "/api/admin/subscriptions/refresh" and method == "POST":
+            return self._refresh_subscription()
+        elif path == "/api/admin/subscriptions/refresh-all" and method == "POST":
+            return self._refresh_all_subscriptions()
+        # Mihomo
+        elif path == "/api/admin/mihomo/status" and method == "GET":
+            return self._mihomo_status()
+        elif path == "/api/admin/mihomo/start" and method == "POST":
+            return self._mihomo_start()
+        elif path == "/api/admin/mihomo/stop" and method == "POST":
+            return self._mihomo_stop()
+        elif path == "/api/admin/mihomo/switch" and method == "POST":
+            return self._mihomo_switch()
         else:
             self._send_json({"error": {"message": "not found"}}, 404)
 
@@ -372,3 +419,218 @@ class AdminAPI:
     def _put_models(self):
         # Models are currently static; accept but note limitation
         self._send_json({"ok": True, "note": "models are built-in, custom model mapping not yet supported"})
+
+    # ─── Nodes ──────────────────────────────────────────────────────────────────
+
+    def _get_nodes(self):
+        from . import nodes
+        node_list = nodes.list_nodes()
+        stats = nodes.get_stats()
+        self._send_json({"nodes": node_list, "stats": stats})
+
+    def _delete_node(self):
+        from . import nodes
+        body = self._parse_body()
+        if body is None:
+            return self._send_json({"error": {"message": "invalid JSON"}}, 400)
+        uri = body.get("raw_uri", "")
+        if not uri:
+            return self._send_json({"error": {"message": "raw_uri required"}}, 400)
+        ok = nodes.delete_node(uri)
+        self._send_json({"ok": ok})
+
+    def _test_node(self):
+        from . import nodes
+        body = self._parse_body()
+        if body is None:
+            return self._send_json({"error": {"message": "invalid JSON"}}, 400)
+        uri = body.get("raw_uri", "")
+        timeout = body.get("timeout_seconds", 10)
+        if not uri:
+            return self._send_json({"error": {"message": "raw_uri required"}}, 400)
+        ok, latency, err = nodes.test_node(uri, timeout)
+        self._send_json({"success": ok, "latency_ms": latency, "error": err})
+
+    def _enable_node(self):
+        from . import nodes
+        body = self._parse_body()
+        if body is None:
+            return self._send_json({"error": {"message": "invalid JSON"}}, 400)
+        uri = body.get("raw_uri", "")
+        ok = nodes.set_disabled(uri, False)
+        self._send_json({"ok": ok})
+
+    def _disable_node(self):
+        from . import nodes
+        body = self._parse_body()
+        if body is None:
+            return self._send_json({"error": {"message": "invalid JSON"}}, 400)
+        uri = body.get("raw_uri", "")
+        ok = nodes.set_disabled(uri, True)
+        self._send_json({"ok": ok})
+
+    def _import_nodes(self):
+        from . import nodes, node_import
+        body = self._parse_body()
+        if body is None:
+            return self._send_json({"error": {"message": "invalid JSON"}}, 400)
+        text = body.get("text", "")
+        if not text.strip():
+            return self._send_json({"error": {"message": "text required"}}, 400)
+        try:
+            parsed = node_import.parse_subscription_text(text)
+            added, skipped = nodes.merge_nodes(parsed)
+            self._send_json({"added": added, "skipped": skipped})
+        except Exception as e:
+            self._send_json({"error": {"message": str(e)}}, 400)
+
+    def _batch_enable(self):
+        from . import nodes
+        body = self._parse_body()
+        if body is None:
+            return self._send_json({"error": {"message": "invalid JSON"}}, 400)
+        uris = body.get("uris", [])
+        changed = nodes.batch_set_disabled(uris, False)
+        self._send_json({"changed": changed})
+
+    def _batch_disable(self):
+        from . import nodes
+        body = self._parse_body()
+        if body is None:
+            return self._send_json({"error": {"message": "invalid JSON"}}, 400)
+        uris = body.get("uris", [])
+        changed = nodes.batch_set_disabled(uris, True)
+        self._send_json({"changed": changed})
+
+    def _batch_delete(self):
+        from . import nodes
+        body = self._parse_body()
+        if body is None:
+            return self._send_json({"error": {"message": "invalid JSON"}}, 400)
+        uris = body.get("uris", [])
+        removed = nodes.batch_delete(uris)
+        self._send_json({"removed": removed})
+
+    def _dedup_nodes(self):
+        from . import nodes
+        removed = nodes.dedup_nodes()
+        self._send_json({"removed": removed})
+
+    def _delete_disabled(self):
+        from . import nodes
+        removed = nodes.delete_disabled()
+        self._send_json({"removed": removed})
+
+    # ─── Subscriptions ───────────────────────────────────────────────────────
+
+    def _get_subscriptions(self):
+        from . import subscriptions
+        subs = subscriptions.list_subscriptions()
+        self._send_json({"subscriptions": subs})
+
+    def _add_subscription(self):
+        from . import subscriptions
+        body = self._parse_body()
+        if body is None:
+            return self._send_json({"error": {"message": "invalid JSON"}}, 400)
+        url = (body.get("url") or "").strip()
+        if not url:
+            return self._send_json({"error": {"message": "url required"}}, 400)
+        source = subscriptions.upsert_subscription({
+            "url": url,
+            "name": body.get("name", ""),
+            "auto_refresh": body.get("auto_refresh", False),
+            "refresh_interval_minutes": body.get("refresh_interval_minutes", 360),
+        })
+        self._send_json(source)
+
+    def _update_subscription(self):
+        from . import subscriptions
+        body = self._parse_body()
+        if body is None:
+            return self._send_json({"error": {"message": "invalid JSON"}}, 400)
+        sid = body.get("id") or body.get("source_id") or ""
+        if not sid:
+            return self._send_json({"error": {"message": "id required"}}, 400)
+        fields = {k: v for k, v in body.items() if k not in ("id", "source_id")}
+        result = subscriptions.update_subscription(sid, fields)
+        if result:
+            self._send_json(result)
+        else:
+            self._send_json({"error": {"message": "not found"}}, 404)
+
+    def _delete_subscription(self):
+        from . import subscriptions
+        body = self._parse_body()
+        if body is None:
+            return self._send_json({"error": {"message": "invalid JSON"}}, 400)
+        sid = body.get("id") or ""
+        delete_nodes = bool(body.get("delete_nodes", False))
+        ok = subscriptions.delete_subscription(sid, delete_nodes)
+        self._send_json({"ok": ok})
+
+    def _fetch_subscription(self):
+        from . import subscriptions
+        body = self._parse_body()
+        if body is None:
+            return self._send_json({"error": {"message": "invalid JSON"}}, 400)
+        url = (body.get("url") or "").strip()
+        if not url:
+            return self._send_json({"error": {"message": "url required"}}, 400)
+        source, result, error = subscriptions.fetch_and_save(
+            url,
+            name=body.get("name", ""),
+            auto_refresh=body.get("auto_refresh", False),
+            refresh_interval_minutes=body.get("refresh_interval_minutes", 360),
+            adopt_existing=body.get("adopt_existing", True),
+        )
+        if error:
+            self._send_json({"error": {"message": error}}, 400)
+        else:
+            self._send_json({"source_id": source["id"], "result": result})
+
+    def _refresh_subscription(self):
+        from . import subscriptions
+        body = self._parse_body()
+        if body is None:
+            return self._send_json({"error": {"message": "invalid JSON"}}, 400)
+        sid = body.get("id") or ""
+        source, result, error = subscriptions.refresh_source(sid, body.get("adopt_existing", True))
+        if error:
+            self._send_json({"error": {"message": error}}, 400)
+        else:
+            self._send_json({"source_id": source["id"], "result": result})
+
+    def _refresh_all_subscriptions(self):
+        from . import subscriptions
+        results = subscriptions.refresh_all(True)
+        self._send_json({"results": results})
+
+    # ─── Mihomo ────────────────────────────────────────────────────────────────
+
+    def _mihomo_status(self):
+        from . import mihomo
+        self._send_json({
+            "available": mihomo.is_available(),
+            "running": mihomo.is_running(),
+            "local_proxy": mihomo.get_local_proxy(),
+        })
+
+    def _mihomo_start(self):
+        from . import mihomo
+        ok, msg = mihomo.start()
+        self._send_json({"ok": ok, "message": msg})
+
+    def _mihomo_stop(self):
+        from . import mihomo
+        mihomo.stop()
+        self._send_json({"ok": True})
+
+    def _mihomo_switch(self):
+        from . import mihomo
+        body = self._parse_body()
+        if body is None:
+            return self._send_json({"error": {"message": "invalid JSON"}}, 400)
+        uri = body.get("raw_uri", "")
+        ok, msg = mihomo.switch_proxy(uri)
+        self._send_json({"ok": ok, "message": msg})
