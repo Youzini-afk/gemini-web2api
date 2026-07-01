@@ -15,13 +15,6 @@ try:
 except ImportError:
     HAS_HTTPX = False
 
-try:
-    from curl_cffi import requests as curl_requests
-    HAS_CURL_CFFI = True
-except Exception:
-    curl_requests = None
-    HAS_CURL_CFFI = False
-
 from .config import CONFIG
 
 _ssl_ctx = None
@@ -36,40 +29,6 @@ def _node_attempts():
         return max(1, min(int(raw), 64))
     except (TypeError, ValueError):
         return 16
-
-
-def _curl_impersonate():
-    return os.environ.get("GEMINI_WEB2API_CURL_IMPERSONATE") or CONFIG.get("curl_impersonate") or "chrome"
-
-
-def _prefer_curl_cffi():
-    """Whether curl_cffi should be the primary upstream transport.
-
-    curl_cffi is useful for browser TLS impersonation, but some Zeabur images
-    can fail all impersonation profiles with low-level curl(35)/OpenSSL errors.
-    Keep it opt-in so a broken native TLS stack cannot break otherwise working
-    direct/httpx traffic.
-    """
-    raw = os.environ.get("GEMINI_WEB2API_USE_CURL_CFFI")
-    if raw is None:
-        raw = CONFIG.get("use_curl_cffi", False)
-    return str(raw).strip().lower() in ("1", "true", "yes", "on")
-
-
-def _curl_impersonate_candidates():
-    """Return compatible curl_cffi browser profiles to try.
-
-    Some curl_cffi wheels/platforms fail specific fixed Chrome profiles with
-    low-level curl(35) TLS errors. Try the configured/default profile first,
-    then older broadly-supported Chrome profiles before blaming the node.
-    """
-    first = _curl_impersonate()
-    candidates = [first, "chrome", "chrome120", "chrome110"]
-    result = []
-    for item in candidates:
-        if item and item not in result:
-            result.append(item)
-    return result
 
 
 def log(msg: str):
@@ -164,6 +123,9 @@ def _record_node_health(raw_uri, success, latency_ms=0, error=None):
     if not raw_uri:
         return
     try:
+        from . import browser_transport
+        if isinstance(error, browser_transport.BrowserTransportUnavailable):
+            return
         from . import nodes
         if success:
             nodes.record_health(raw_uri, True, latency_ms=latency_ms)
@@ -175,38 +137,16 @@ def _record_node_health(raw_uri, success, latency_ms=0, error=None):
 
 
 def _post_upstream(body, url, headers, proxy, ctx):
-    """POST to Gemini upstream.
-
-    Prefer curl_cffi browser TLS impersonation when available. Vex uses a
-    Chrome-like tls-client profile; plain Python OpenSSL/httpx/urllib can hit
-    Gemini Web EOF/protocol failures on nodes that work in vex.
-    """
-    if _prefer_curl_cffi() and HAS_CURL_CFFI and curl_requests is not None:
-        last_exc = None
-        for profile in _curl_impersonate_candidates():
-            try:
-                resp = curl_requests.post(
-                    url,
-                    data=body,
-                    headers=headers,
-                    proxy=proxy,
-                    impersonate=profile,
-                    timeout=CONFIG["request_timeout_sec"],
-                    verify=True,
-                    default_headers=False,
-                )
-                resp.raise_for_status()
-                return resp.text
-            except Exception as e:
-                last_exc = e
-                s = str(e).lower()
-                # Retry only profile-level curl/TLS compatibility failures on
-                # the same node. HTTP/status/upstream errors should not be
-                # hidden by changing fingerprints.
-                if "curl: (35)" not in s and "tls connect error" not in s and "invalid library" not in s:
-                    raise
-                log(f"curl_cffi profile {profile} failed: {e}")
-        raise last_exc or RuntimeError("curl_cffi request failed")
+    """POST to Gemini upstream. Proxied requests use Go tls-client helper."""
+    if proxy:
+        from . import browser_transport
+        if browser_transport.available():
+            return browser_transport.post(url, headers, body, proxy, CONFIG["request_timeout_sec"])
+        if not browser_transport.allow_python_fallback():
+            raise browser_transport.BrowserTransportUnavailable(
+                "Gemini TLS helper unavailable for proxied request; set GEMINI_WEB2API_TLS_HELPER "
+                "or enable GEMINI_WEB2API_ALLOW_PYTHON_TRANSPORT_FALLBACK=1"
+            )
 
     if proxy and HAS_HTTPX:
         transport = httpx.HTTPTransport(proxy=proxy)
@@ -270,21 +210,22 @@ def _account_prefix() -> str:
 def _build_headers() -> dict:
     account_prefix = _account_prefix()
     headers = {
-        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
-        "Origin": "https://gemini.google.com",
-        "Pragma": "no-cache",
-        "Referer": f"https://gemini.google.com{account_prefix}/app",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-        "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "Accept": "*/*",
+        "Origin": "https://gemini.google.com",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "Referer": f"https://gemini.google.com{account_prefix}/app",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Priority": "u=1, i",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
         "X-Same-Domain": "1",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     }
     if account_prefix:
         headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
@@ -397,6 +338,15 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     ctx = _get_ssl_ctx()
     has_node_pool = _enabled_clash_candidates_exist()
 
+    if has_node_pool:
+        from . import browser_transport
+        if not browser_transport.available() and not browser_transport.allow_python_fallback():
+            raise browser_transport.BrowserTransportUnavailable(
+                "Gemini TLS helper unavailable for node pool; Docker image must include gemini-tls-helper"
+            )
+        if browser_transport.available() and not browser_transport.allow_python_fallback():
+            browser_transport.ensure_available()
+
     last_err = None
     failed_nodes = set()
     attempts = _node_attempts() if has_node_pool else CONFIG["retry_attempts"]
@@ -432,16 +382,25 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
 
 def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
     """Streaming generation with retry on connection failure."""
-    if not (_prefer_curl_cffi() and HAS_CURL_CFFI) and not HAS_HTTPX:
+    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
+    url = _get_url()
+    headers = _build_headers()
+    has_node_pool = _enabled_clash_candidates_exist()
+
+    if has_node_pool:
+        from . import browser_transport
+        if not browser_transport.available() and not browser_transport.allow_python_fallback():
+            raise browser_transport.BrowserTransportUnavailable(
+                "Gemini TLS helper unavailable for node pool; Docker image must include gemini-tls-helper"
+            )
+        if browser_transport.available() and not browser_transport.allow_python_fallback():
+            browser_transport.ensure_available()
+
+    if not HAS_HTTPX and not has_node_pool:
         text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         if text:
             yield text
         return
-
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
-    url = _get_url()
-    headers = _build_headers()
-    has_node_pool = _enabled_clash_candidates_exist()
 
     last_err = None
     failed_nodes = set()
@@ -451,7 +410,6 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         raw_uri = None
         proxy = None
         client = None
-        curl_resp = None
         try:
             if has_node_pool:
                 raw_uri, proxy, proxy_msg = _select_mihomo_proxy(failed_nodes)
@@ -462,52 +420,35 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                         time.sleep(CONFIG["retry_delay_sec"])
                         continue
                     break
-            if _prefer_curl_cffi() and HAS_CURL_CFFI and curl_requests is not None:
-                started = time.time()
-                prev_text = ""
-                last_profile_exc = None
-                for profile in _curl_impersonate_candidates():
-                    try:
-                        curl_resp = curl_requests.post(
-                            url,
-                            data=body,
-                            headers=headers,
-                            proxy=proxy,
-                            impersonate=profile,
-                            timeout=CONFIG["request_timeout_sec"],
-                            verify=True,
-                            default_headers=False,
-                            stream=True,
+            if proxy:
+                from . import browser_transport
+                if not browser_transport.available():
+                    if not browser_transport.allow_python_fallback():
+                        raise RuntimeError(
+                            "Gemini TLS helper unavailable for proxied stream; set GEMINI_WEB2API_TLS_HELPER "
+                            "or enable GEMINI_WEB2API_ALLOW_PYTHON_TRANSPORT_FALLBACK=1"
                         )
-                        break
-                    except Exception as e:
-                        last_profile_exc = e
-                        s = str(e).lower()
-                        if "curl: (35)" not in s and "tls connect error" not in s and "invalid library" not in s:
-                            raise
-                        log(f"curl_cffi stream profile {profile} failed: {e}")
-                if curl_resp is None:
-                    raise last_profile_exc or RuntimeError("curl_cffi stream request failed")
-                curl_resp.raise_for_status()
-                buf = ""
-                for chunk in curl_resp.iter_content():
-                    if not chunk:
-                        continue
-                    if isinstance(chunk, bytes):
-                        chunk = chunk.decode("utf-8", errors="replace")
-                    buf += chunk
-                    _raise_bard_error_if_present(buf)
-                    while "\n" in buf:
-                        line, buf = buf.split("\n", 1)
-                        for t in _extract_texts_from_line(line):
-                            if len(t) > len(prev_text):
-                                delta = clean_text(t[len(prev_text):])
-                                if delta:
-                                    yielded = True
-                                    yield delta
-                                prev_text = t
-                _record_node_health(raw_uri, True, latency_ms=int((time.time() - started) * 1000))
-                return
+                else:
+                    started = time.time()
+                    prev_text = ""
+                    buf = ""
+                    for chunk in browser_transport.stream(url, headers, body, proxy, CONFIG["request_timeout_sec"]):
+                        buf += chunk
+                        _raise_bard_error_if_present(buf)
+                        while "\n" in buf:
+                            line, buf = buf.split("\n", 1)
+                            for t in _extract_texts_from_line(line):
+                                if len(t) > len(prev_text):
+                                    delta = clean_text(t[len(prev_text):])
+                                    if delta:
+                                        yielded = True
+                                        yield delta
+                                    prev_text = t
+                    _record_node_health(raw_uri, True, latency_ms=int((time.time() - started) * 1000))
+                    return
+
+            if proxy and not HAS_HTTPX:
+                raise RuntimeError("httpx unavailable for Python proxy fallback")
 
             if proxy:
                 transport = httpx.HTTPTransport(proxy=proxy)
@@ -545,11 +486,6 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 log(f"Stream retry {attempt+1}/{attempts}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
         finally:
-            if curl_resp is not None:
-                try:
-                    curl_resp.close()
-                except Exception:
-                    pass
             if proxy and client is not None:
                 try:
                     client.close()

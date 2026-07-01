@@ -1,3 +1,11 @@
+FROM golang:1.24.1 AS tls-helper-builder
+
+WORKDIR /src/tls_helper
+COPY tls_helper/go.mod tls_helper/go.sum ./
+RUN go mod download
+COPY tls_helper ./
+RUN CGO_ENABLED=0 go build -o /out/gemini-tls-helper .
+
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -10,6 +18,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # Install Python dependencies
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
+
+COPY --from=tls-helper-builder /out/gemini-tls-helper /usr/local/bin/gemini-tls-helper
 
 # Download mihomo binary (Clash core for proxy node support)
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates wget && \
