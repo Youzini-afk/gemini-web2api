@@ -616,6 +616,9 @@ class AdminAPI:
             "local_proxy": mihomo.get_local_proxy(),
             "worker_count": mihomo.worker_count(),
             "active_raw_uri": mihomo.get_active_raw_uri(),
+            "manual_active_raw_uri": mihomo.get_manual_active_raw_uri(),
+            "last_used_raw_uri": mihomo.get_last_used_raw_uri(),
+            "bad_count": mihomo.bad_count(),
         })
 
     def _mihomo_start(self):

@@ -23,6 +23,14 @@ _httpx_client = None
 _httpx_client_proxy = None
 
 
+def _node_attempts():
+    raw = os.environ.get("GEMINI_WEB2API_NODE_ATTEMPTS") or CONFIG.get("node_attempts") or 16
+    try:
+        return max(1, min(int(raw), 64))
+    except (TypeError, ValueError):
+        return 16
+
+
 def log(msg: str):
     if CONFIG["log_requests"]:
         import sys
@@ -78,6 +86,20 @@ def _enabled_clash_candidates_exist() -> bool:
 
 def _classify_proxy_error(exc: Exception) -> str:
     msg = str(exc).lower()
+    if "429" in msg or "resource exhausted" in msg or "rate limit" in msg or "ratelimit" in msg or "too many requests" in msg:
+        return "ratelimit"
+    if "recaptcha" in msg or "captcha" in msg or "token" in msg:
+        return "recaptcha"
+    if "auth" in msg or "permission" in msg or "401" in msg or "403" in msg or "forbidden" in msg or "unauth" in msg:
+        return "auth"
+    if "client canceled" in msg or "client cancelled" in msg or "request canceled" in msg or "request cancelled" in msg:
+        return "client_canceled"
+    if "context canceled" in msg or "context cancelled" in msg:
+        return "context_canceled"
+    if "safety" in msg or "content filter" in msg or "blocked" in msg or "prohibited" in msg:
+        return "safety"
+    if "invalid" in msg or "bad request" in msg or "unsupported" in msg or "invalid_argument" in msg:
+        return "invalid_request"
     if "timed out" in msg or "timeout" in msg:
         return "timeout"
     if "ssl" in msg or "tls" in msg or "certificate" in msg:
@@ -92,7 +114,7 @@ def _classify_proxy_error(exc: Exception) -> str:
 def _select_mihomo_proxy(failed_nodes):
     try:
         from . import mihomo
-        return mihomo.get_proxy_for_request(exclude=failed_nodes, attempts=32)
+        return mihomo.get_proxy_for_request(exclude=failed_nodes, attempts=_node_attempts())
     except Exception as e:
         return None, None, str(e)
 
@@ -273,7 +295,8 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
 
     last_err = None
     failed_nodes = set()
-    for attempt in range(CONFIG["retry_attempts"]):
+    attempts = _node_attempts() if has_node_pool else CONFIG["retry_attempts"]
+    for attempt in range(attempts):
         raw_uri = None
         proxy = None
         if has_node_pool:
@@ -281,7 +304,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             if not proxy:
                 last_err = RuntimeError(f"Mihomo node pool unavailable: {proxy_msg}")
                 log(str(last_err))
-                if attempt < CONFIG["retry_attempts"] - 1:
+                if attempt < attempts - 1:
                     time.sleep(CONFIG["retry_delay_sec"])
                     continue
                 break
@@ -306,8 +329,8 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             if raw_uri:
                 failed_nodes.add(raw_uri)
                 _record_node_health(raw_uri, False, error=e)
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+            if attempt < attempts - 1:
+                log(f"Retry {attempt+1}/{attempts}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
     raise last_err
 
@@ -328,7 +351,8 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
     last_err = None
     failed_nodes = set()
     yielded = False
-    for attempt in range(CONFIG["retry_attempts"]):
+    attempts = _node_attempts() if has_node_pool else CONFIG["retry_attempts"]
+    for attempt in range(attempts):
         raw_uri = None
         proxy = None
         client = None
@@ -338,7 +362,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 if not proxy:
                     last_err = RuntimeError(f"Mihomo node pool unavailable: {proxy_msg}")
                     log(str(last_err))
-                    if attempt < CONFIG["retry_attempts"] - 1:
+                    if attempt < attempts - 1:
                         time.sleep(CONFIG["retry_delay_sec"])
                         continue
                     break
@@ -374,8 +398,8 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 _record_node_health(raw_uri, False, error=e)
             if yielded:
                 raise
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
+            if attempt < attempts - 1:
+                log(f"Stream retry {attempt+1}/{attempts}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
         finally:
             if proxy and client is not None:

@@ -47,7 +47,8 @@ _last_config_skips = []
 # Per-node worker pool. Each worker owns an independent mihomo process and
 # single-node config, so one invalid proxy can never poison global startup.
 _workers = {}  # raw_uri -> worker dict
-_active_raw_uri = None
+_manual_active_raw_uri = None
+_last_used_raw_uri = None
 _bad_until = {}  # raw_uri -> unix ts for local startup/config backoff
 _max_workers = int(os.environ.get("MIHOMO_MAX_WORKERS", "8") or 8)
 _idle_timeout = int(os.environ.get("MIHOMO_IDLE_TIMEOUT", "900") or 900)
@@ -146,7 +147,13 @@ def _worker_alive(worker):
 
 
 def _stop_worker_unlocked(raw_uri):
+    global _manual_active_raw_uri, _last_used_raw_uri
     worker = _workers.pop(raw_uri, None)
+    _uri_to_name.pop(raw_uri, None)
+    if _manual_active_raw_uri == raw_uri:
+        _manual_active_raw_uri = None
+    if _last_used_raw_uri == raw_uri:
+        _last_used_raw_uri = None
     if not worker:
         return
     proc = worker.get("process")
@@ -177,16 +184,16 @@ def _prune_workers_unlocked():
     now = time.time()
     for raw_uri, worker in list(_workers.items()):
         if not _worker_alive(worker):
-            _workers.pop(raw_uri, None)
+            _stop_worker_unlocked(raw_uri)
             continue
-        if raw_uri == _active_raw_uri:
+        if raw_uri == _manual_active_raw_uri:
             continue
         if now - worker.get("last_used_at", now) > _idle_timeout:
             _stop_worker_unlocked(raw_uri)
     if len(_workers) <= _max_workers:
         return
     victims = sorted(
-        ((w.get("last_used_at", 0), raw) for raw, w in _workers.items() if raw != _active_raw_uri),
+        ((w.get("last_used_at", 0), raw) for raw, w in _workers.items() if raw != _manual_active_raw_uri),
         key=lambda x: x[0],
     )
     for _, raw_uri in victims[:max(0, len(_workers) - _max_workers)]:
@@ -223,28 +230,37 @@ def _single_node_config(raw_uri, node, mixed_port, controller_port, secret):
 
 def ensure_worker(raw_uri):
     """Ensure one mihomo worker is running for raw_uri. Returns (ok, proxy_url, msg)."""
-    global _active_raw_uri
+    global _last_used_raw_uri
     with _lock:
         _prune_workers_unlocked()
         now = time.time()
-        if _bad_until.get(raw_uri, 0) > now:
-            return False, None, "node is cooling after mihomo startup/config failure"
-
         worker = _workers.get(raw_uri)
-        if _worker_alive(worker):
-            worker["last_used_at"] = now
-            return True, f"http://127.0.0.1:{worker['mixed_port']}", "worker already running"
-        if worker:
-            _workers.pop(raw_uri, None)
 
         node = nodes.get_node(raw_uri)
         if not node:
+            if worker:
+                _stop_worker_unlocked(raw_uri)
             return False, None, "node not found"
         if node.get("disabled"):
+            if worker:
+                _stop_worker_unlocked(raw_uri)
             return False, None, "node is disabled"
         h = node.get("health") or {}
         if h.get("cooldown_until", 0) > now:
+            if worker:
+                _stop_worker_unlocked(raw_uri)
             return False, None, "node is cooling"
+        if _bad_until.get(raw_uri, 0) > now:
+            if worker:
+                _stop_worker_unlocked(raw_uri)
+            return False, None, "node is cooling after mihomo startup/config failure"
+
+        if _worker_alive(worker):
+            worker["last_used_at"] = now
+            _last_used_raw_uri = raw_uri
+            return True, f"http://127.0.0.1:{worker['mixed_port']}", "worker already running"
+        if worker:
+            _stop_worker_unlocked(raw_uri)
         if not node.get("clash_config"):
             return False, None, "node has no clash_config"
 
@@ -315,8 +331,20 @@ def ensure_worker(raw_uri):
             "last_used_at": now,
         }
         _uri_to_name[raw_uri] = proxy_name
-        _active_raw_uri = raw_uri
+        _last_used_raw_uri = raw_uri
         return True, f"http://127.0.0.1:{mixed_port}", f"mihomo worker started (pid={proc.pid}, proxy=127.0.0.1:{mixed_port})"
+
+
+def _node_usable(raw_uri):
+    now = time.time()
+    node = nodes.get_node(raw_uri)
+    if not node or node.get("disabled") or not node.get("clash_config"):
+        return False
+    if (node.get("health") or {}).get("cooldown_until", 0) > now:
+        return False
+    if _bad_until.get(raw_uri, 0) > now:
+        return False
+    return True
 
 
 def get_proxy_for_request(preferred_raw_uri=None, exclude=None, attempts=8):
@@ -325,9 +353,14 @@ def get_proxy_for_request(preferred_raw_uri=None, exclude=None, attempts=8):
     tried = set()
     choices = []
     with _lock:
-        preferred = preferred_raw_uri or _active_raw_uri
-    if preferred and preferred not in exclude:
+        preferred = preferred_raw_uri or _manual_active_raw_uri
+        last_used = _last_used_raw_uri
+    if last_used and last_used != preferred and not _node_usable(last_used):
+        stop_worker(last_used)
+    if preferred and preferred not in exclude and _node_usable(preferred):
         choices.append(preferred)
+    elif preferred and preferred not in exclude:
+        stop_worker(preferred)
     for node in nodes.select_available_clash_nodes(limit=attempts, exclude=exclude | set(choices)):
         choices.append(node.get("raw_uri"))
 
@@ -351,7 +384,37 @@ def worker_count():
 
 def get_active_raw_uri():
     with _lock:
-        return _active_raw_uri
+        return _manual_active_raw_uri or _last_used_raw_uri
+
+
+def get_manual_active_raw_uri():
+    with _lock:
+        return _manual_active_raw_uri
+
+
+def get_last_used_raw_uri():
+    with _lock:
+        return _last_used_raw_uri
+
+
+def bad_count():
+    now = time.time()
+    with _lock:
+        return sum(1 for until in _bad_until.values() if until > now)
+
+
+def stop_worker(raw_uri, clear_bad=False):
+    """Stop and forget one worker. Does not touch node storage/health."""
+    with _lock:
+        _stop_worker_unlocked(raw_uri)
+        if clear_bad:
+            _bad_until.pop(raw_uri, None)
+
+
+def clear_bad(raw_uri):
+    """Clear local mihomo startup/config backoff for a node."""
+    with _lock:
+        _bad_until.pop(raw_uri, None)
 
 
 def is_available():
@@ -377,9 +440,10 @@ def get_local_proxy():
     """Return the local proxy URL if mihomo is running, else None."""
     with _lock:
         _prune_workers_unlocked()
-        if _active_raw_uri in _workers and _worker_alive(_workers[_active_raw_uri]):
-            w = _workers[_active_raw_uri]
-            return f"http://127.0.0.1:{w['mixed_port']}"
+        for raw_uri in (_manual_active_raw_uri, _last_used_raw_uri):
+            if raw_uri in _workers and _worker_alive(_workers[raw_uri]):
+                w = _workers[raw_uri]
+                return f"http://127.0.0.1:{w['mixed_port']}"
         for w in _workers.values():
             if _worker_alive(w):
                 return f"http://127.0.0.1:{w['mixed_port']}"
@@ -388,11 +452,15 @@ def get_local_proxy():
 
 def get_proxy_name(raw_uri):
     """Get the mihomo proxy name for a raw_uri."""
+    node = nodes.get_node(raw_uri)
+    now = time.time()
+    if not node or node.get("disabled") or (node.get("health") or {}).get("cooldown_until", 0) > now:
+        stop_worker(raw_uri)
+        return None
     with _lock:
         w = _workers.get(raw_uri)
         if w:
             return w.get("proxy_name")
-    node = nodes.get_node(raw_uri)
     if node and node.get("clash_config"):
         return node["clash_config"].get("name") or node.get("name")
     return _uri_to_name.get(raw_uri)
@@ -500,12 +568,13 @@ def start():
 
 def stop():
     """Stop all mihomo worker subprocesses."""
-    global _process, _enabled, _active_raw_uri
+    global _process, _enabled, _manual_active_raw_uri, _last_used_raw_uri
 
     with _lock:
         for raw_uri in list(_workers.keys()):
             _stop_worker_unlocked(raw_uri)
-        _active_raw_uri = None
+        _manual_active_raw_uri = None
+        _last_used_raw_uri = None
         if _process is None:
             _enabled = False
             return
@@ -542,11 +611,11 @@ def restart():
 
 def switch_proxy(raw_uri):
     """Set active node and ensure its dedicated worker is running."""
-    global _active_raw_uri
+    global _manual_active_raw_uri
     ok, proxy, msg = ensure_worker(raw_uri)
     if ok:
         with _lock:
-            _active_raw_uri = raw_uri
+            _manual_active_raw_uri = raw_uri
         return True, f"switched to {get_proxy_name(raw_uri)} ({proxy})"
     return False, msg
 
