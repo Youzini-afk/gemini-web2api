@@ -30,7 +30,10 @@ except ImportError:
     HAS_YAML = False
 
 _process = None
-_lock = threading.Lock()
+# RLock prevents self-deadlock when lifecycle operations call helpers that also
+# inspect process state. start() previously held _lock and called is_running(),
+# which tried to acquire the same non-reentrant Lock and blocked forever.
+_lock = threading.RLock()
 _local_proxy_port = 7890
 _controller_port = 9090
 _controller_secret = ""
@@ -84,9 +87,14 @@ def is_available():
 def is_running():
     """Check if mihomo subprocess is currently running."""
     with _lock:
-        if _process is None:
-            return False
-        return _process.poll() is None
+        return _is_running_unlocked()
+
+
+def _is_running_unlocked():
+    """Check process state. Caller must hold _lock."""
+    if _process is None:
+        return False
+    return _process.poll() is None
 
 
 def get_local_proxy():
@@ -162,7 +170,7 @@ def start():
     global _process, _enabled
 
     with _lock:
-        if is_running():
+        if _is_running_unlocked():
             return True, "already running"
 
         binary = _find_binary()
