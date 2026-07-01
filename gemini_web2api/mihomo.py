@@ -50,6 +50,21 @@ def _log_file():
     return os.path.join(get_data_dir(), "mihomo.log")
 
 
+def _tail_log(max_chars=1600):
+    """Return the tail of mihomo.log for actionable startup errors."""
+    path = _log_file()
+    try:
+        with open(path, "rb") as f:
+            try:
+                f.seek(-max_chars, os.SEEK_END)
+            except OSError:
+                f.seek(0)
+            data = f.read().decode("utf-8", errors="replace").strip()
+            return data[-max_chars:]
+    except Exception:
+        return ""
+
+
 def _find_binary():
     """Find mihomo binary. Returns path or None."""
     # Check common locations
@@ -186,7 +201,7 @@ def start():
             f.write(config_str)
 
         log_path = _log_file()
-        log_fd = open(log_path, "a")
+        log_fd = open(log_path, "a", buffering=1)
 
         try:
             _process = subprocess.Popen(
@@ -195,13 +210,22 @@ def start():
                 stderr=subprocess.STDOUT,
                 preexec_fn=os.setsid,  # New process group for clean kill
             )
+            log_fd.close()
             _enabled = True
             time.sleep(1)  # Give it a moment to start
             if _process.poll() is not None:
+                code = _process.returncode
                 _enabled = False
-                return False, "mihomo exited immediately — check config"
+                tail = _tail_log()
+                if tail:
+                    return False, f"mihomo exited immediately (code={code}). Log tail: {tail}"
+                return False, f"mihomo exited immediately (code={code}) — check {_config_file()}"
             return True, f"mihomo started (pid={_process.pid}, proxy=127.0.0.1:{_local_proxy_port})"
         except Exception as e:
+            try:
+                log_fd.close()
+            except Exception:
+                pass
             _enabled = False
             return False, str(e)
 
