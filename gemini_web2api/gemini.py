@@ -68,6 +68,49 @@ def _get_httpx_client():
     return _httpx_client
 
 
+def _enabled_clash_candidates_exist() -> bool:
+    try:
+        from . import nodes
+        return bool(nodes.has_enabled_clash_nodes())
+    except Exception:
+        return False
+
+
+def _classify_proxy_error(exc: Exception) -> str:
+    msg = str(exc).lower()
+    if "timed out" in msg or "timeout" in msg:
+        return "timeout"
+    if "ssl" in msg or "tls" in msg or "certificate" in msg:
+        return "tls"
+    if "refused" in msg:
+        return "connection_refused"
+    if "network" in msg or "unreachable" in msg:
+        return "network_unreachable"
+    return "unknown"
+
+
+def _select_mihomo_proxy(failed_nodes):
+    try:
+        from . import mihomo
+        return mihomo.get_proxy_for_request(exclude=failed_nodes, attempts=32)
+    except Exception as e:
+        return None, None, str(e)
+
+
+def _record_node_health(raw_uri, success, latency_ms=0, error=None):
+    if not raw_uri:
+        return
+    try:
+        from . import nodes
+        if success:
+            nodes.record_health(raw_uri, True, latency_ms=latency_ms)
+        else:
+            err = error if isinstance(error, Exception) else Exception(str(error or "unknown"))
+            nodes.record_health(raw_uri, False, error_type=_classify_proxy_error(err), error_msg=str(error))
+    except Exception:
+        pass
+
+
 def load_cookie() -> tuple:
     """Load cookie from file with mtime-based caching."""
     cookie_file = CONFIG.get("cookie_file")
@@ -226,11 +269,26 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     url = _get_url()
     headers = _build_headers()
     ctx = _get_ssl_ctx()
-    proxy = CONFIG.get("proxy")
+    has_node_pool = _enabled_clash_candidates_exist()
 
     last_err = None
+    failed_nodes = set()
     for attempt in range(CONFIG["retry_attempts"]):
+        raw_uri = None
+        proxy = None
+        if has_node_pool:
+            raw_uri, proxy, proxy_msg = _select_mihomo_proxy(failed_nodes)
+            if not proxy:
+                last_err = RuntimeError(f"Mihomo node pool unavailable: {proxy_msg}")
+                log(str(last_err))
+                if attempt < CONFIG["retry_attempts"] - 1:
+                    time.sleep(CONFIG["retry_delay_sec"])
+                    continue
+                break
+        if not proxy and not has_node_pool:
+            proxy = CONFIG.get("proxy")
         try:
+            started = time.time()
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             if proxy:
                 opener = urllib.request.build_opener(
@@ -241,9 +299,13 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
+            _record_node_health(raw_uri, True, latency_ms=int((time.time() - started) * 1000))
             return extract_response_text(raw)
         except Exception as e:
             last_err = e
+            if raw_uri:
+                failed_nodes.add(raw_uri)
+                _record_node_health(raw_uri, False, error=e)
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
@@ -261,11 +323,33 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
     url = _get_url()
     headers = _build_headers()
-    client = _get_httpx_client()
+    has_node_pool = _enabled_clash_candidates_exist()
 
     last_err = None
+    failed_nodes = set()
+    yielded = False
     for attempt in range(CONFIG["retry_attempts"]):
+        raw_uri = None
+        proxy = None
+        client = None
         try:
+            if has_node_pool:
+                raw_uri, proxy, proxy_msg = _select_mihomo_proxy(failed_nodes)
+                if not proxy:
+                    last_err = RuntimeError(f"Mihomo node pool unavailable: {proxy_msg}")
+                    log(str(last_err))
+                    if attempt < CONFIG["retry_attempts"] - 1:
+                        time.sleep(CONFIG["retry_delay_sec"])
+                        continue
+                    break
+            if proxy:
+                transport = httpx.HTTPTransport(proxy=proxy)
+                client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
+            elif not has_node_pool:
+                client = _get_httpx_client()
+            else:
+                client = httpx.Client(timeout=CONFIG["request_timeout_sec"], verify=True)
+            started = time.time()
             prev_text = ""
             with client.stream("POST", url, content=body, headers=headers) as resp:
                 buf = ""
@@ -278,12 +362,25 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             if len(t) > len(prev_text):
                                 delta = clean_text(t[len(prev_text):])
                                 if delta:
+                                    yielded = True
                                     yield delta
                                 prev_text = t
+            _record_node_health(raw_uri, True, latency_ms=int((time.time() - started) * 1000))
             return
         except Exception as e:
             last_err = e
+            if raw_uri:
+                failed_nodes.add(raw_uri)
+                _record_node_health(raw_uri, False, error=e)
+            if yielded:
+                raise
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
+        finally:
+            if proxy and client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
     raise last_err

@@ -13,10 +13,12 @@ Design constraints (@oracle):
 import json
 import os
 import signal
+import socket
 import subprocess
 import threading
 import time
 import secrets
+import hashlib
 import urllib.request
 import urllib.parse
 
@@ -42,6 +44,14 @@ _select_group = "GEMINI_SELECT"
 _uri_to_name = {}  # raw_uri -> mihomo proxy name
 _last_config_skips = []
 
+# Per-node worker pool. Each worker owns an independent mihomo process and
+# single-node config, so one invalid proxy can never poison global startup.
+_workers = {}  # raw_uri -> worker dict
+_active_raw_uri = None
+_bad_until = {}  # raw_uri -> unix ts for local startup/config backoff
+_max_workers = int(os.environ.get("MIHOMO_MAX_WORKERS", "8") or 8)
+_idle_timeout = int(os.environ.get("MIHOMO_IDLE_TIMEOUT", "900") or 900)
+
 
 def _config_file():
     return os.path.join(get_data_dir(), "mihomo_config.yaml")
@@ -51,9 +61,9 @@ def _log_file():
     return os.path.join(get_data_dir(), "mihomo.log")
 
 
-def _tail_log(max_chars=1600):
-    """Return the tail of mihomo.log for actionable startup errors."""
-    path = _log_file()
+def _tail_log(max_chars=1600, path=None):
+    """Return the tail of a mihomo log for actionable startup errors."""
+    path = path or _log_file()
     try:
         with open(path, "rb") as f:
             try:
@@ -114,15 +124,246 @@ def _find_binary():
     return None
 
 
+def _workers_dir():
+    path = os.path.join(get_data_dir(), "mihomo_workers")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _raw_hash(raw_uri):
+    return hashlib.sha256(raw_uri.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def _free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _worker_alive(worker):
+    proc = worker.get("process") if worker else None
+    return proc is not None and proc.poll() is None
+
+
+def _stop_worker_unlocked(raw_uri):
+    worker = _workers.pop(raw_uri, None)
+    if not worker:
+        return
+    proc = worker.get("process")
+    if not proc:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def _prune_workers_unlocked():
+    now = time.time()
+    for raw_uri, worker in list(_workers.items()):
+        if not _worker_alive(worker):
+            _workers.pop(raw_uri, None)
+            continue
+        if raw_uri == _active_raw_uri:
+            continue
+        if now - worker.get("last_used_at", now) > _idle_timeout:
+            _stop_worker_unlocked(raw_uri)
+    if len(_workers) <= _max_workers:
+        return
+    victims = sorted(
+        ((w.get("last_used_at", 0), raw) for raw, w in _workers.items() if raw != _active_raw_uri),
+        key=lambda x: x[0],
+    )
+    for _, raw_uri in victims[:max(0, len(_workers) - _max_workers)]:
+        _stop_worker_unlocked(raw_uri)
+
+
+def _single_node_config(raw_uri, node, mixed_port, controller_port, secret):
+    if not HAS_YAML:
+        return None, "PyYAML is required for mihomo config generation"
+    clash = node.get("clash_config")
+    if not clash:
+        return None, "node has no clash_config"
+    proxy = dict(clash)
+    name = proxy.get("name") or node.get("name") or f"node-{_raw_hash(raw_uri)}"
+    proxy["name"] = name
+    skip_reason = _proxy_skip_reason(proxy)
+    if skip_reason:
+        return None, skip_reason
+    config = {
+        "mixed-port": mixed_port,
+        "allow-lan": False,
+        "mode": "rule",
+        "log-level": "warning",
+        "external-controller": f"127.0.0.1:{controller_port}",
+        "secret": secret,
+        "proxies": [proxy],
+        "proxy-groups": [
+            {"name": _select_group, "type": "select", "proxies": [name]},
+        ],
+        "rules": [f"MATCH,{_select_group}"],
+    }
+    return yaml.dump(config, allow_unicode=True, default_flow_style=False), ""
+
+
+def ensure_worker(raw_uri):
+    """Ensure one mihomo worker is running for raw_uri. Returns (ok, proxy_url, msg)."""
+    global _active_raw_uri
+    with _lock:
+        _prune_workers_unlocked()
+        now = time.time()
+        if _bad_until.get(raw_uri, 0) > now:
+            return False, None, "node is cooling after mihomo startup/config failure"
+
+        worker = _workers.get(raw_uri)
+        if _worker_alive(worker):
+            worker["last_used_at"] = now
+            return True, f"http://127.0.0.1:{worker['mixed_port']}", "worker already running"
+        if worker:
+            _workers.pop(raw_uri, None)
+
+        node = nodes.get_node(raw_uri)
+        if not node:
+            return False, None, "node not found"
+        if node.get("disabled"):
+            return False, None, "node is disabled"
+        h = node.get("health") or {}
+        if h.get("cooldown_until", 0) > now:
+            return False, None, "node is cooling"
+        if not node.get("clash_config"):
+            return False, None, "node has no clash_config"
+
+        binary = _find_binary()
+        if not binary:
+            return False, None, "mihomo binary not found"
+
+        mixed_port = _free_port()
+        controller_port = _free_port()
+        secret = secrets.token_hex(12)
+        stem = _raw_hash(raw_uri)
+        cfg_path = os.path.join(_workers_dir(), f"{stem}.yaml")
+        log_path = os.path.join(_workers_dir(), f"{stem}.log")
+        config_str, err = _single_node_config(raw_uri, node, mixed_port, controller_port, secret)
+        if not config_str:
+            nodes.record_health(raw_uri, False, error_type="invalid_config", error_msg=err)
+            _bad_until[raw_uri] = now + 3600
+            return False, None, err
+        with open(cfg_path, "w") as f:
+            f.write(config_str)
+
+        ok, test_msg = _run_config_test(binary, cfg_path)
+        if not ok:
+            nodes.record_health(raw_uri, False, error_type="invalid_config", error_msg=test_msg)
+            _bad_until[raw_uri] = now + 3600
+            return False, None, f"mihomo config test failed for node: {test_msg}"
+
+        log_fd = open(log_path, "a", buffering=1)
+        try:
+            proc = subprocess.Popen(
+                [binary, "-f", cfg_path],
+                stdout=log_fd,
+                stderr=subprocess.STDOUT,
+                preexec_fn=os.setsid,
+            )
+        except Exception as e:
+            log_fd.close()
+            msg = str(e)
+            nodes.record_health(raw_uri, False, error_type="proxy_start", error_msg=msg)
+            _bad_until[raw_uri] = now + 300
+            return False, None, msg
+        finally:
+            try:
+                log_fd.close()
+            except Exception:
+                pass
+
+        time.sleep(0.5)
+        if proc.poll() is not None:
+            code = proc.returncode
+            tail = _tail_log(path=log_path)
+            msg = f"mihomo worker exited immediately (code={code})"
+            if tail:
+                msg += f". Log tail: {tail}"
+            nodes.record_health(raw_uri, False, error_type="proxy_start", error_msg=msg)
+            _bad_until[raw_uri] = now + 300
+            return False, None, msg
+
+        proxy_name = (node.get("clash_config") or {}).get("name") or node.get("name") or f"node-{stem}"
+        _workers[raw_uri] = {
+            "process": proc,
+            "mixed_port": mixed_port,
+            "controller_port": controller_port,
+            "secret": secret,
+            "config_path": cfg_path,
+            "log_path": log_path,
+            "proxy_name": proxy_name,
+            "last_used_at": now,
+        }
+        _uri_to_name[raw_uri] = proxy_name
+        _active_raw_uri = raw_uri
+        return True, f"http://127.0.0.1:{mixed_port}", f"mihomo worker started (pid={proc.pid}, proxy=127.0.0.1:{mixed_port})"
+
+
+def get_proxy_for_request(preferred_raw_uri=None, exclude=None, attempts=8):
+    """Return (raw_uri, proxy_url, msg), trying candidates until a worker starts."""
+    exclude = set(exclude or [])
+    tried = set()
+    choices = []
+    with _lock:
+        preferred = preferred_raw_uri or _active_raw_uri
+    if preferred and preferred not in exclude:
+        choices.append(preferred)
+    for node in nodes.select_available_clash_nodes(limit=attempts, exclude=exclude | set(choices)):
+        choices.append(node.get("raw_uri"))
+
+    last_msg = "no enabled nodes with clash config"
+    for raw_uri in [c for c in choices if c]:
+        if raw_uri in tried or raw_uri in exclude:
+            continue
+        tried.add(raw_uri)
+        ok, proxy, msg = ensure_worker(raw_uri)
+        if ok:
+            return raw_uri, proxy, msg
+        last_msg = msg
+    return None, None, last_msg
+
+
+def worker_count():
+    with _lock:
+        _prune_workers_unlocked()
+        return len(_workers)
+
+
+def get_active_raw_uri():
+    with _lock:
+        return _active_raw_uri
+
+
 def is_available():
     """Check if mihomo binary is available."""
     return _find_binary() is not None
 
 
 def is_running():
-    """Check if mihomo subprocess is currently running."""
+    """Check if any per-node mihomo subprocess is currently running."""
     with _lock:
-        return _is_running_unlocked()
+        _prune_workers_unlocked()
+        return any(_worker_alive(w) for w in _workers.values())
 
 
 def _is_running_unlocked():
@@ -134,13 +375,26 @@ def _is_running_unlocked():
 
 def get_local_proxy():
     """Return the local proxy URL if mihomo is running, else None."""
-    if is_running():
-        return f"http://127.0.0.1:{_local_proxy_port}"
-    return None
+    with _lock:
+        _prune_workers_unlocked()
+        if _active_raw_uri in _workers and _worker_alive(_workers[_active_raw_uri]):
+            w = _workers[_active_raw_uri]
+            return f"http://127.0.0.1:{w['mixed_port']}"
+        for w in _workers.values():
+            if _worker_alive(w):
+                return f"http://127.0.0.1:{w['mixed_port']}"
+        return None
 
 
 def get_proxy_name(raw_uri):
     """Get the mihomo proxy name for a raw_uri."""
+    with _lock:
+        w = _workers.get(raw_uri)
+        if w:
+            return w.get("proxy_name")
+    node = nodes.get_node(raw_uri)
+    if node and node.get("clash_config"):
+        return node["clash_config"].get("name") or node.get("name")
     return _uri_to_name.get(raw_uri)
 
 
@@ -237,70 +491,23 @@ def _generate_config():
 
 
 def start():
-    """Start mihomo subprocess. Returns (success, message)."""
-    global _process, _enabled
-
-    with _lock:
-        if _is_running_unlocked():
-            return True, "already running"
-
-        binary = _find_binary()
-        if not binary:
-            return False, "mihomo binary not found"
-
-        config_str = _generate_config()
-        if not config_str:
-            if _last_config_skips:
-                first = _last_config_skips[0]
-                return False, f"all enabled nodes were skipped; first skip: {first.get('name')}: {first.get('reason')}"
-            return False, "no enabled nodes with clash config"
-
-        cfg_path = _config_file()
-        with open(cfg_path, "w") as f:
-            f.write(config_str)
-
-        ok, test_msg = _run_config_test(binary, cfg_path)
-        if not ok:
-            _enabled = False
-            return False, f"mihomo config test failed: {test_msg}"
-
-        log_path = _log_file()
-        log_fd = open(log_path, "a", buffering=1)
-
-        try:
-            _process = subprocess.Popen(
-                [binary, "-f", cfg_path],
-                stdout=log_fd,
-                stderr=subprocess.STDOUT,
-                preexec_fn=os.setsid,  # New process group for clean kill
-            )
-            log_fd.close()
-            _enabled = True
-            time.sleep(1)  # Give it a moment to start
-            if _process.poll() is not None:
-                code = _process.returncode
-                _enabled = False
-                tail = _tail_log()
-                if tail:
-                    return False, f"mihomo exited immediately (code={code}). Log tail: {tail}"
-                return False, f"mihomo exited immediately (code={code}) — check {_config_file()}"
-            skip_note = f", skipped {len(_last_config_skips)} invalid node(s)" if _last_config_skips else ""
-            return True, f"mihomo started (pid={_process.pid}, proxy=127.0.0.1:{_local_proxy_port}{skip_note})"
-        except Exception as e:
-            try:
-                log_fd.close()
-            except Exception:
-                pass
-            _enabled = False
-            return False, str(e)
+    """Warm one per-node mihomo worker. Returns (success, message)."""
+    raw_uri, proxy, msg = get_proxy_for_request(attempts=max(32, _max_workers))
+    if raw_uri and proxy:
+        return True, msg
+    return False, msg
 
 
 def stop():
-    """Stop mihomo subprocess."""
-    global _process, _enabled
+    """Stop all mihomo worker subprocesses."""
+    global _process, _enabled, _active_raw_uri
 
     with _lock:
+        for raw_uri in list(_workers.keys()):
+            _stop_worker_unlocked(raw_uri)
+        _active_raw_uri = None
         if _process is None:
+            _enabled = False
             return
 
         try:
@@ -334,25 +541,14 @@ def restart():
 
 
 def switch_proxy(raw_uri):
-    """Switch the selector group to a specific node via controller API."""
-    name = _uri_to_name.get(raw_uri)
-    if not name:
-        return False, "node not found in mihomo config"
-
-    if not is_running():
-        return False, "mihomo not running"
-
-    try:
-        url = f"http://127.0.0.1:{_controller_port}/proxies/{urllib.parse.quote(_select_group)}"
-        data = json.dumps({"name": name}).encode()
-        req = urllib.request.Request(url, data=data, method="PUT", headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {_controller_secret}",
-        })
-        urllib.request.urlopen(req, timeout=5)
-        return True, f"switched to {name}"
-    except Exception as e:
-        return False, str(e)
+    """Set active node and ensure its dedicated worker is running."""
+    global _active_raw_uri
+    ok, proxy, msg = ensure_worker(raw_uri)
+    if ok:
+        with _lock:
+            _active_raw_uri = raw_uri
+        return True, f"switched to {get_proxy_name(raw_uri)} ({proxy})"
+    return False, msg
 
 
 def test_proxy_delay(proxy_name, timeout=10):
@@ -375,6 +571,37 @@ def test_proxy_delay(proxy_name, timeout=10):
             return False, 0
     except Exception:
         return False, 0
+
+
+def test_node_delay(raw_uri, timeout=10):
+    """Test delay for a node through its dedicated worker controller.
+    Returns (success, latency_ms, error_msg).
+    """
+    ok, _proxy, msg = ensure_worker(raw_uri)
+    if not ok:
+        return False, 0, msg
+    with _lock:
+        worker = _workers.get(raw_uri)
+    if not worker or not _worker_alive(worker):
+        return False, 0, "mihomo worker not running"
+    proxy_name = worker.get("proxy_name") or get_proxy_name(raw_uri)
+    try:
+        url = (
+            f"http://127.0.0.1:{worker['controller_port']}/proxies/"
+            f"{urllib.parse.quote(proxy_name)}/delay?timeout={timeout*1000}"
+            "&url=https://www.google.com/generate_204"
+        )
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"Bearer {worker['secret']}",
+        })
+        with urllib.request.urlopen(req, timeout=timeout+5) as resp:
+            data = json.loads(resp.read())
+            delay = data.get("delay", 0)
+            if delay > 0:
+                return True, delay, ""
+            return False, 0, "delay test failed"
+    except Exception as e:
+        return False, 0, str(e)
 
 
 def get_proxy_list():

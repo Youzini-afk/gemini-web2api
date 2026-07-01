@@ -77,6 +77,18 @@ def list_nodes():
         return result
 
 
+def get_node(raw_uri):
+    """Return one node with health data merged in, or None."""
+    _ensure_loaded()
+    with _lock:
+        for n in _node_list:
+            if n.get("raw_uri") == raw_uri:
+                node = dict(n)
+                node["health"] = _health_map.get(raw_uri, {})
+                return node
+        return None
+
+
 def get_stats():
     """Return aggregate node statistics."""
     _ensure_loaded()
@@ -163,6 +175,13 @@ def set_disabled(raw_uri, disabled):
         for n in _node_list:
             if n.get("raw_uri") == raw_uri:
                 n["disabled"] = disabled
+                if not disabled:
+                    h = _health_map.get(raw_uri)
+                    if h:
+                        h["cooldown_until"] = 0
+                        h["consecutive_failures"] = 0
+                        h["last_test_error"] = ""
+                        _save_health()
                 _save_nodes()
                 return True
         return False
@@ -236,6 +255,48 @@ def get_enabled_clash_proxies():
         return result
 
 
+def select_available_clash_nodes(limit=8, exclude=None):
+    """Return enabled, non-cooling nodes with clash_config, best health first."""
+    _ensure_loaded()
+    exclude = set(exclude or [])
+    with _lock:
+        now = time.time()
+        candidates = []
+        for n in _node_list:
+            raw_uri = n.get("raw_uri", "")
+            if not raw_uri or raw_uri in exclude:
+                continue
+            if n.get("disabled"):
+                continue
+            clash = n.get("clash_config")
+            if not clash:
+                continue
+            h = _health_map.get(raw_uri, {})
+            if h.get("cooldown_until", 0) > now:
+                continue
+            node = dict(n)
+            node["health"] = h
+            latency = h.get("last_test_latency") or 999999
+            success_rank = 0 if h.get("success_count", 0) > 0 else 1
+            candidates.append((
+                h.get("consecutive_failures", 0),
+                h.get("fail_count", 0),
+                success_rank,
+                latency,
+                -(h.get("last_test_at", 0) or 0),
+                node,
+            ))
+        candidates.sort(key=lambda item: item[:-1])
+        return [item[-1] for item in candidates[:limit]]
+
+
+def has_enabled_clash_nodes():
+    """Return True if the user has any enabled Clash-capable node configured."""
+    _ensure_loaded()
+    with _lock:
+        return any((not n.get("disabled")) and n.get("clash_config") for n in _node_list)
+
+
 def record_health(raw_uri, success, error_type="", latency_ms=0, error_msg=""):
     """Record a health event for a node. Updates cooldown/score based on error type."""
     _ensure_loaded()
@@ -272,7 +333,11 @@ def record_health(raw_uri, success, error_type="", latency_ms=0, error_msg=""):
                 h["last_test_latency"] = latency_ms
             # Graded cooldown based on error type and consecutive failures
             cf = h["consecutive_failures"]
-            if error_type == "ratelimit":
+            if error_type == "invalid_config":
+                h["cooldown_until"] = int(now + 3600)
+            elif error_type == "proxy_start":
+                h["cooldown_until"] = int(now + 300)
+            elif error_type == "ratelimit":
                 # Soft cooldown: 30-180s, no heavy penalty
                 h["cooldown_until"] = int(now + min(30 + cf * 30, 180))
             elif error_type in ("timeout", "tls", "unknown"):
@@ -294,16 +359,15 @@ def test_node(raw_uri, timeout=10):
     """Test a node by dialing through mihomo. Returns (success, latency_ms, error)."""
     try:
         from . import mihomo
-        proxy_name = mihomo.get_proxy_name(raw_uri)
-        if not proxy_name:
-            return False, 0, "node not found in mihomo config"
-        ok, latency = mihomo.test_proxy_delay(proxy_name, timeout)
+        ok, latency, err = mihomo.test_node_delay(raw_uri, timeout)
         if ok:
             record_health(raw_uri, True, latency_ms=latency)
             return True, latency, ""
         else:
-            record_health(raw_uri, False, error_type="timeout", error_msg="delay test failed")
-            return False, 0, "delay test failed"
+            msg = err or "delay test failed"
+            error_type = "invalid_config" if "config" in msg.lower() else "timeout"
+            record_health(raw_uri, False, error_type=error_type, error_msg=msg)
+            return False, 0, msg
     except Exception as e:
         record_health(raw_uri, False, error_type="unknown", error_msg=str(e))
         return False, 0, str(e)
