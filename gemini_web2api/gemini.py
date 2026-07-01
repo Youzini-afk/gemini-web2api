@@ -160,7 +160,6 @@ def _post_upstream(body, url, headers, proxy, ctx):
             impersonate=_curl_impersonate(),
             timeout=CONFIG["request_timeout_sec"],
             verify=True,
-            trust_env=False,
             default_headers=False,
         )
         resp.raise_for_status()
@@ -431,7 +430,6 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                     impersonate=_curl_impersonate(),
                     timeout=CONFIG["request_timeout_sec"],
                     verify=True,
-                    trust_env=False,
                     default_headers=False,
                     stream=True,
                 )
