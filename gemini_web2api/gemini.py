@@ -62,7 +62,7 @@ def _get_httpx_client():
         proxy = CONFIG.get("proxy")
     if _httpx_client is None and HAS_HTTPX:
         transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
-        _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
+        _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True, trust_env=False)
         _httpx_client_proxy = proxy
     elif _httpx_client is not None and proxy != _httpx_client_proxy:
         # Proxy changed — rebuild client
@@ -71,7 +71,7 @@ def _get_httpx_client():
         except Exception:
             pass
         transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
-        _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
+        _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True, trust_env=False)
         _httpx_client_proxy = proxy
     return _httpx_client
 
@@ -131,6 +131,34 @@ def _record_node_health(raw_uri, success, latency_ms=0, error=None):
             nodes.record_health(raw_uri, False, error_type=_classify_proxy_error(err), error_msg=str(error))
     except Exception:
         pass
+
+
+def _post_upstream(body, url, headers, proxy, ctx):
+    """POST to Gemini upstream.
+
+    When routing through a Mihomo worker, prefer httpx over urllib. The Go vex
+    stack uses a dedicated HTTP client/session over the node dialer; Python's
+    urllib has shown TLS EOF/protocol issues through some Mihomo HTTP CONNECT
+    paths even when the same node works in vex. httpx is already required for
+    streaming and behaves more consistently for proxied HTTPS requests.
+    """
+    if proxy and HAS_HTTPX:
+        transport = httpx.HTTPTransport(proxy=proxy)
+        with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True, trust_env=False) as client:
+            resp = client.post(url, content=body, headers=headers)
+            resp.raise_for_status()
+            return resp.text
+
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    if proxy:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+            urllib.request.HTTPSHandler(context=ctx)
+        )
+        resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
+    else:
+        resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
+    return resp.read().decode("utf-8", errors="replace")
 
 
 def load_cookie() -> tuple:
@@ -312,16 +340,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             proxy = CONFIG.get("proxy")
         try:
             started = time.time()
-            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-            if proxy:
-                opener = urllib.request.build_opener(
-                    urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
-                    urllib.request.HTTPSHandler(context=ctx)
-                )
-                resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
-            else:
-                resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
-            raw = resp.read().decode("utf-8", errors="replace")
+            raw = _post_upstream(body, url, headers, proxy, ctx)
             _record_node_health(raw_uri, True, latency_ms=int((time.time() - started) * 1000))
             return extract_response_text(raw)
         except Exception as e:
@@ -368,11 +387,11 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                     break
             if proxy:
                 transport = httpx.HTTPTransport(proxy=proxy)
-                client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
+                client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True, trust_env=False)
             elif not has_node_pool:
                 client = _get_httpx_client()
             else:
-                client = httpx.Client(timeout=CONFIG["request_timeout_sec"], verify=True)
+                client = httpx.Client(timeout=CONFIG["request_timeout_sec"], verify=True, trust_env=False)
             started = time.time()
             prev_text = ""
             with client.stream("POST", url, content=body, headers=headers) as resp:
