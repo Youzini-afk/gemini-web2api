@@ -206,7 +206,15 @@ body::after {
   padding: 4px 8px;
 }
 
-.content { padding: 28px; max-width: 1280px; width: 100%; }
+/* Fluid full-width content: no fixed cap, side padding scales with viewport
+   so wide screens get generous gutters instead of an empty right column.
+   A soft cap at very large widths keeps line lengths sane without left-aligning. */
+.content {
+  padding: 28px clamp(20px, 3.5vw, 56px);
+  width: 100%;
+  max-width: 1760px;
+  margin-inline: auto;
+}
 
 .page { animation: rise 0.32s cubic-bezier(0.2,0.7,0.2,1) both; }
 
@@ -242,7 +250,7 @@ body::after {
 
 .stat-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
   gap: 16px;
   margin-bottom: 22px;
 }
@@ -339,7 +347,7 @@ body::after {
 
 .form-grid {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   gap: 16px 18px;
 }
 .field { display: flex; flex-direction: column; gap: 6px; }
@@ -570,7 +578,7 @@ textarea:focus {
 
 .model-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 14px;
 }
 .model-card {
@@ -685,6 +693,22 @@ textarea:focus {
   .stat-value { font-size: 24px; }
   .toast-container { left: 12px; right: 12px; bottom: 12px; }
   .toast { max-width: none; min-width: 0; }
+}
+
+/* ─── Wide-screen refinements ────────────────────────────────────── */
+/* Let content breathe, but keep form density controlled so individual
+   inputs don't stretch absurdly wide on ultra-wide displays. */
+
+@media (min-width: 1400px) {
+  /* Cap form grids at 3 columns; fields stay comfortably wide, not thin. */
+  .form-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@media (min-width: 1700px) {
+  /* Stat cards: nudge minimum up so the 5 stat tiles don't over-stretch. */
+  .stat-grid { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+  /* A touch more breathing room on the largest screens. */
+  .content { padding: 32px clamp(32px, 4vw, 64px); }
 }
 
 /* Scrollbar */
