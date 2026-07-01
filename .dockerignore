@@ -12,5 +12,12 @@ __pycache__/
 config.json
 cookie.txt
 cookie.json
+api_keys.json
+nodes.json
+node_health.json
+subscriptions.json
+mihomo_config.yaml
+mihomo.log
 *.log
 .DS_Store
+.slim/
