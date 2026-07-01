@@ -15,6 +15,13 @@ try:
 except ImportError:
     HAS_HTTPX = False
 
+try:
+    from curl_cffi import requests as curl_requests
+    HAS_CURL_CFFI = True
+except Exception:
+    curl_requests = None
+    HAS_CURL_CFFI = False
+
 from .config import CONFIG
 
 _ssl_ctx = None
@@ -29,6 +36,10 @@ def _node_attempts():
         return max(1, min(int(raw), 64))
     except (TypeError, ValueError):
         return 16
+
+
+def _curl_impersonate():
+    return os.environ.get("GEMINI_WEB2API_CURL_IMPERSONATE") or CONFIG.get("curl_impersonate") or "chrome124"
 
 
 def log(msg: str):
@@ -102,7 +113,7 @@ def _classify_proxy_error(exc: Exception) -> str:
         return "invalid_request"
     if "timed out" in msg or "timeout" in msg:
         return "timeout"
-    if "ssl" in msg or "tls" in msg or "certificate" in msg:
+    if "ssl" in msg or "tls" in msg or "certificate" in msg or "eof" in msg or "curl: (35)" in msg or "boringssl" in msg or "http/2 stream" in msg:
         return "tls"
     if "refused" in msg:
         return "connection_refused"
@@ -136,12 +147,25 @@ def _record_node_health(raw_uri, success, latency_ms=0, error=None):
 def _post_upstream(body, url, headers, proxy, ctx):
     """POST to Gemini upstream.
 
-    When routing through a Mihomo worker, prefer httpx over urllib. The Go vex
-    stack uses a dedicated HTTP client/session over the node dialer; Python's
-    urllib has shown TLS EOF/protocol issues through some Mihomo HTTP CONNECT
-    paths even when the same node works in vex. httpx is already required for
-    streaming and behaves more consistently for proxied HTTPS requests.
+    Prefer curl_cffi browser TLS impersonation when available. Vex uses a
+    Chrome-like tls-client profile; plain Python OpenSSL/httpx/urllib can hit
+    Gemini Web EOF/protocol failures on nodes that work in vex.
     """
+    if HAS_CURL_CFFI and curl_requests is not None:
+        resp = curl_requests.post(
+            url,
+            data=body,
+            headers=headers,
+            proxy=proxy,
+            impersonate=_curl_impersonate(),
+            timeout=CONFIG["request_timeout_sec"],
+            verify=True,
+            trust_env=False,
+            default_headers=False,
+        )
+        resp.raise_for_status()
+        return resp.text
+
     if proxy and HAS_HTTPX:
         transport = httpx.HTTPTransport(proxy=proxy)
         with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True, trust_env=False) as client:
@@ -204,11 +228,21 @@ def _account_prefix() -> str:
 def _build_headers() -> dict:
     account_prefix = _account_prefix()
     headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
         "Origin": "https://gemini.google.com",
+        "Pragma": "no-cache",
         "Referer": f"https://gemini.google.com{account_prefix}/app",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
         "X-Same-Domain": "1",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     }
     if account_prefix:
         headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
@@ -355,8 +389,8 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
 
 
 def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
-    """Streaming generation via httpx with retry on connection failure."""
-    if not HAS_HTTPX:
+    """Streaming generation with retry on connection failure."""
+    if not HAS_CURL_CFFI and not HAS_HTTPX:
         text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         if text:
             yield text
@@ -375,6 +409,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         raw_uri = None
         proxy = None
         client = None
+        curl_resp = None
         try:
             if has_node_pool:
                 raw_uri, proxy, proxy_msg = _select_mihomo_proxy(failed_nodes)
@@ -385,6 +420,42 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                         time.sleep(CONFIG["retry_delay_sec"])
                         continue
                     break
+            if HAS_CURL_CFFI and curl_requests is not None:
+                started = time.time()
+                prev_text = ""
+                curl_resp = curl_requests.post(
+                    url,
+                    data=body,
+                    headers=headers,
+                    proxy=proxy,
+                    impersonate=_curl_impersonate(),
+                    timeout=CONFIG["request_timeout_sec"],
+                    verify=True,
+                    trust_env=False,
+                    default_headers=False,
+                    stream=True,
+                )
+                curl_resp.raise_for_status()
+                buf = ""
+                for chunk in curl_resp.iter_content():
+                    if not chunk:
+                        continue
+                    if isinstance(chunk, bytes):
+                        chunk = chunk.decode("utf-8", errors="replace")
+                    buf += chunk
+                    _raise_bard_error_if_present(buf)
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        for t in _extract_texts_from_line(line):
+                            if len(t) > len(prev_text):
+                                delta = clean_text(t[len(prev_text):])
+                                if delta:
+                                    yielded = True
+                                    yield delta
+                                prev_text = t
+                _record_node_health(raw_uri, True, latency_ms=int((time.time() - started) * 1000))
+                return
+
             if proxy:
                 transport = httpx.HTTPTransport(proxy=proxy)
                 client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True, trust_env=False)
@@ -421,6 +492,11 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 log(f"Stream retry {attempt+1}/{attempts}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
         finally:
+            if curl_resp is not None:
+                try:
+                    curl_resp.close()
+                except Exception:
+                    pass
             if proxy and client is not None:
                 try:
                     client.close()
