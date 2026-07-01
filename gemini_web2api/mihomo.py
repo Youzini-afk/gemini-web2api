@@ -40,6 +40,7 @@ _controller_secret = ""
 _enabled = False
 _select_group = "GEMINI_SELECT"
 _uri_to_name = {}  # raw_uri -> mihomo proxy name
+_last_config_skips = []
 
 
 def _config_file():
@@ -143,8 +144,36 @@ def get_proxy_name(raw_uri):
     return _uri_to_name.get(raw_uri)
 
 
+def _valid_reality_short_id(value):
+    """Validate Mihomo/Xray REALITY short-id.
+
+    REALITY short-id must be an even-length hex string up to 16 chars. Empty is
+    valid/omitted. Some free subscriptions contain placeholder or malformed
+    short IDs; Mihomo rejects the entire config if even one proxy is invalid.
+    """
+    if value is None:
+        return True
+    s = str(value).strip()
+    if not s:
+        return True
+    if len(s) > 16 or len(s) % 2 != 0:
+        return False
+    return all(c in "0123456789abcdefABCDEF" for c in s)
+
+
+def _proxy_skip_reason(proxy_dict):
+    """Return reason to skip a proxy, or empty string if it is safe to emit."""
+    reality = proxy_dict.get("reality-opts")
+    if isinstance(reality, dict):
+        sid = reality.get("short-id")
+        if not _valid_reality_short_id(sid):
+            return f"invalid REALITY short ID: {sid!r}"
+    return ""
+
+
 def _generate_config():
     """Generate Clash YAML config from enabled nodes."""
+    global _last_config_skips
     if not HAS_YAML:
         return None
 
@@ -154,6 +183,7 @@ def _generate_config():
 
     proxy_list = []
     proxy_names = []
+    _last_config_skips = []
     _uri_to_name.clear()
 
     for i, (raw_uri, clash_cfg) in enumerate(enabled):
@@ -168,9 +198,16 @@ def _generate_config():
 
         proxy_dict = dict(clash_cfg)
         proxy_dict["name"] = name
+        skip_reason = _proxy_skip_reason(proxy_dict)
+        if skip_reason:
+            _last_config_skips.append({"name": name, "raw_uri": raw_uri, "reason": skip_reason})
+            continue
         proxy_list.append(proxy_dict)
         proxy_names.append(name)
         _uri_to_name[raw_uri] = name
+
+    if not proxy_list:
+        return None
 
     global _controller_secret
     if not _controller_secret:
@@ -213,6 +250,9 @@ def start():
 
         config_str = _generate_config()
         if not config_str:
+            if _last_config_skips:
+                first = _last_config_skips[0]
+                return False, f"all enabled nodes were skipped; first skip: {first.get('name')}: {first.get('reason')}"
             return False, "no enabled nodes with clash config"
 
         cfg_path = _config_file()
@@ -244,7 +284,8 @@ def start():
                 if tail:
                     return False, f"mihomo exited immediately (code={code}). Log tail: {tail}"
                 return False, f"mihomo exited immediately (code={code}) — check {_config_file()}"
-            return True, f"mihomo started (pid={_process.pid}, proxy=127.0.0.1:{_local_proxy_port})"
+            skip_note = f", skipped {len(_last_config_skips)} invalid node(s)" if _last_config_skips else ""
+            return True, f"mihomo started (pid={_process.pid}, proxy=127.0.0.1:{_local_proxy_port}{skip_note})"
         except Exception as e:
             try:
                 log_fd.close()
