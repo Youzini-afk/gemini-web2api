@@ -39,7 +39,23 @@ def _node_attempts():
 
 
 def _curl_impersonate():
-    return os.environ.get("GEMINI_WEB2API_CURL_IMPERSONATE") or CONFIG.get("curl_impersonate") or "chrome124"
+    return os.environ.get("GEMINI_WEB2API_CURL_IMPERSONATE") or CONFIG.get("curl_impersonate") or "chrome"
+
+
+def _curl_impersonate_candidates():
+    """Return compatible curl_cffi browser profiles to try.
+
+    Some curl_cffi wheels/platforms fail specific fixed Chrome profiles with
+    low-level curl(35) TLS errors. Try the configured/default profile first,
+    then older broadly-supported Chrome profiles before blaming the node.
+    """
+    first = _curl_impersonate()
+    candidates = [first, "chrome", "chrome120", "chrome110"]
+    result = []
+    for item in candidates:
+        if item and item not in result:
+            result.append(item)
+    return result
 
 
 def log(msg: str):
@@ -152,18 +168,31 @@ def _post_upstream(body, url, headers, proxy, ctx):
     Gemini Web EOF/protocol failures on nodes that work in vex.
     """
     if HAS_CURL_CFFI and curl_requests is not None:
-        resp = curl_requests.post(
-            url,
-            data=body,
-            headers=headers,
-            proxy=proxy,
-            impersonate=_curl_impersonate(),
-            timeout=CONFIG["request_timeout_sec"],
-            verify=True,
-            default_headers=False,
-        )
-        resp.raise_for_status()
-        return resp.text
+        last_exc = None
+        for profile in _curl_impersonate_candidates():
+            try:
+                resp = curl_requests.post(
+                    url,
+                    data=body,
+                    headers=headers,
+                    proxy=proxy,
+                    impersonate=profile,
+                    timeout=CONFIG["request_timeout_sec"],
+                    verify=True,
+                    default_headers=False,
+                )
+                resp.raise_for_status()
+                return resp.text
+            except Exception as e:
+                last_exc = e
+                s = str(e).lower()
+                # Retry only profile-level curl/TLS compatibility failures on
+                # the same node. HTTP/status/upstream errors should not be
+                # hidden by changing fingerprints.
+                if "curl: (35)" not in s and "tls connect error" not in s and "invalid library" not in s:
+                    raise
+                log(f"curl_cffi profile {profile} failed: {e}")
+        raise last_exc or RuntimeError("curl_cffi request failed")
 
     if proxy and HAS_HTTPX:
         transport = httpx.HTTPTransport(proxy=proxy)
@@ -422,17 +451,29 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             if HAS_CURL_CFFI and curl_requests is not None:
                 started = time.time()
                 prev_text = ""
-                curl_resp = curl_requests.post(
-                    url,
-                    data=body,
-                    headers=headers,
-                    proxy=proxy,
-                    impersonate=_curl_impersonate(),
-                    timeout=CONFIG["request_timeout_sec"],
-                    verify=True,
-                    default_headers=False,
-                    stream=True,
-                )
+                last_profile_exc = None
+                for profile in _curl_impersonate_candidates():
+                    try:
+                        curl_resp = curl_requests.post(
+                            url,
+                            data=body,
+                            headers=headers,
+                            proxy=proxy,
+                            impersonate=profile,
+                            timeout=CONFIG["request_timeout_sec"],
+                            verify=True,
+                            default_headers=False,
+                            stream=True,
+                        )
+                        break
+                    except Exception as e:
+                        last_profile_exc = e
+                        s = str(e).lower()
+                        if "curl: (35)" not in s and "tls connect error" not in s and "invalid library" not in s:
+                            raise
+                        log(f"curl_cffi stream profile {profile} failed: {e}")
+                if curl_resp is None:
+                    raise last_profile_exc or RuntimeError("curl_cffi stream request failed")
                 curl_resp.raise_for_status()
                 buf = ""
                 for chunk in curl_resp.iter_content():
