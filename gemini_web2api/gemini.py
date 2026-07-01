@@ -42,6 +42,20 @@ def _curl_impersonate():
     return os.environ.get("GEMINI_WEB2API_CURL_IMPERSONATE") or CONFIG.get("curl_impersonate") or "chrome"
 
 
+def _prefer_curl_cffi():
+    """Whether curl_cffi should be the primary upstream transport.
+
+    curl_cffi is useful for browser TLS impersonation, but some Zeabur images
+    can fail all impersonation profiles with low-level curl(35)/OpenSSL errors.
+    Keep it opt-in so a broken native TLS stack cannot break otherwise working
+    direct/httpx traffic.
+    """
+    raw = os.environ.get("GEMINI_WEB2API_USE_CURL_CFFI")
+    if raw is None:
+        raw = CONFIG.get("use_curl_cffi", False)
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _curl_impersonate_candidates():
     """Return compatible curl_cffi browser profiles to try.
 
@@ -167,7 +181,7 @@ def _post_upstream(body, url, headers, proxy, ctx):
     Chrome-like tls-client profile; plain Python OpenSSL/httpx/urllib can hit
     Gemini Web EOF/protocol failures on nodes that work in vex.
     """
-    if HAS_CURL_CFFI and curl_requests is not None:
+    if _prefer_curl_cffi() and HAS_CURL_CFFI and curl_requests is not None:
         last_exc = None
         for profile in _curl_impersonate_candidates():
             try:
@@ -418,7 +432,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
 
 def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
     """Streaming generation with retry on connection failure."""
-    if not HAS_CURL_CFFI and not HAS_HTTPX:
+    if not (_prefer_curl_cffi() and HAS_CURL_CFFI) and not HAS_HTTPX:
         text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         if text:
             yield text
@@ -448,7 +462,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                         time.sleep(CONFIG["retry_delay_sec"])
                         continue
                     break
-            if HAS_CURL_CFFI and curl_requests is not None:
+            if _prefer_curl_cffi() and HAS_CURL_CFFI and curl_requests is not None:
                 started = time.time()
                 prev_text = ""
                 last_profile_exc = None
