@@ -13,7 +13,7 @@ var _selectedNodes = new Set();
 var _nodeSearchTimer = null;
 
 function loadNodes() {
-  api.getNodes().then(function (data) {
+  return api.getNodes().then(function (data) {
     _allNodes = data.nodes || [];
     _nodeStats = data.stats || {};
     renderNodeStats();
@@ -24,7 +24,7 @@ function loadNodes() {
 }
 
 function loadSubscriptions() {
-  api.getSubscriptions().then(function (data) {
+  return api.getSubscriptions().then(function (data) {
     _subscriptions = data.subscriptions || [];
     renderSubscriptions();
   }).catch(function (e) {
@@ -33,7 +33,7 @@ function loadSubscriptions() {
 }
 
 function loadMihomoStatus() {
-  api.getMihomoStatus().then(function (data) {
+  return api.getMihomoStatus().then(function (data) {
     var text = document.getElementById('mihomo-status-text');
     var info = document.getElementById('mihomo-info');
     var startBtn = document.getElementById('mihomo-start-btn');
@@ -331,10 +331,11 @@ function initNodesPage() {
     }).catch(function (e) { toast('批量删除失败: ' + e.message, 'err'); });
   };
 
-  // Load data
-  loadMihomoStatus();
-  loadNodes();
-  loadSubscriptions();
+  // Data loading is handled by the router via pageNodes.load().
+}
+
+function loadNodesPage() {
+  return Promise.all([loadMihomoStatus(), loadNodes(), loadSubscriptions()]);
 }
 
 function testNode(rawUri) {
@@ -384,3 +385,5 @@ function deleteSub(id, deleteNodes) {
     loadNodes(); loadSubscriptions();
   }).catch(function (e) { toast('删除失败: ' + e.message, 'err'); });
 }
+
+window.pageNodes = { init: initNodesPage, load: loadNodesPage };

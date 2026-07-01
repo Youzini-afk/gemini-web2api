@@ -12,6 +12,7 @@
     settings:   { title: '设置',   module: 'pageSettings' },
     keys:       { title: '密钥',   module: 'pageKeys' },
     models:     { title: '模型',   module: 'pageModels' },
+    nodes:      { title: '节点',   module: 'pageNodes' },
     appearance: { title: '外观',   module: 'pageAppearance' }
   };
   var DEFAULT_ROUTE = 'overview';
