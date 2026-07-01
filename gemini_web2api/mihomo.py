@@ -65,6 +65,25 @@ def _tail_log(max_chars=1600):
         return ""
 
 
+def _run_config_test(binary, cfg_path, max_chars=2400):
+    """Run `mihomo -t -f <config>` and return (ok, message)."""
+    try:
+        result = subprocess.run(
+            [binary, "-t", "-f", cfg_path],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        output = ((result.stdout or "") + ("\n" if result.stdout and result.stderr else "") + (result.stderr or "")).strip()
+        if result.returncode == 0:
+            return True, output[-max_chars:]
+        return False, output[-max_chars:] or f"mihomo config test failed with code {result.returncode}"
+    except subprocess.TimeoutExpired:
+        return False, "mihomo config test timed out"
+    except Exception as e:
+        return False, str(e)
+
+
 def _find_binary():
     """Find mihomo binary. Returns path or None."""
     # Check common locations
@@ -199,6 +218,11 @@ def start():
         cfg_path = _config_file()
         with open(cfg_path, "w") as f:
             f.write(config_str)
+
+        ok, test_msg = _run_config_test(binary, cfg_path)
+        if not ok:
+            _enabled = False
+            return False, f"mihomo config test failed: {test_msg}"
 
         log_path = _log_file()
         log_fd = open(log_path, "a", buffering=1)
