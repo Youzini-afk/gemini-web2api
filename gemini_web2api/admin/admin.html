@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Gemini Web2API · 控制台</title>
-  <link rel="stylesheet" href="admin.css?v=webui-1" />
+  <link rel="stylesheet" href="admin.css?v=webui-2" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Roboto+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -249,7 +249,7 @@
           <div class="card">
             <div class="card-head"><h2 class="card-title">导入节点</h2></div>
             <p class="muted">粘贴 Clash YAML、订阅链接或节点 URI (每行一个)</p>
-            <textarea id="import-text" rows="6" placeholder="proxies:&#10;  - name: ...&#10;  - type: ss ...&#10;或 https://example.com/sub.yaml&#10;或 ss://...&#10;或 vmess://..."></textarea>
+            <textarea id="import-text" class="import-textarea" rows="6" placeholder="proxies:&#10;  - name: ...&#10;  - type: ss ...&#10;或 https://example.com/sub.yaml&#10;或 ss://...&#10;或 vmess://..."></textarea>
             <div class="form-actions">
               <button class="btn btn-primary" id="import-btn">导入</button>
               <span class="muted" id="import-result"></span>
@@ -301,14 +301,14 @@
   <div id="toast-container" class="toast-container"></div>
 
   <!-- Scripts (load order matters) -->
-  <script src="utils.js?v=webui-3"></script>
-  <script src="api.js?v=webui-3"></script>
-  <script src="page-overview.js?v=webui-3"></script>
-  <script src="page-settings.js?v=webui-3"></script>
-  <script src="page-keys.js?v=webui-3"></script>
-  <script src="page-models.js?v=webui-3"></script>
-  <script src="page-nodes.js?v=webui-3"></script>
-  <script src="page-appearance.js?v=webui-3"></script>
-  <script src="admin.js?v=webui-3"></script>
+  <script src="utils.js?v=webui-4"></script>
+  <script src="api.js?v=webui-4"></script>
+  <script src="page-overview.js?v=webui-4"></script>
+  <script src="page-settings.js?v=webui-4"></script>
+  <script src="page-keys.js?v=webui-4"></script>
+  <script src="page-models.js?v=webui-4"></script>
+  <script src="page-nodes.js?v=webui-4"></script>
+  <script src="page-appearance.js?v=webui-4"></script>
+  <script src="admin.js?v=webui-4"></script>
 </body>
 </html>
