@@ -227,30 +227,6 @@ function initNodesPage() {
 
   // Manual import (pasted Clash YAML / node URI only — NOT subscription URLs,
   // which are managed in the dedicated 订阅源同步 card above).
-  var singleImportBtn = document.getElementById('single-node-import-btn');
-  if (singleImportBtn) singleImportBtn.onclick = function () {
-    var input = document.getElementById('single-node-uri');
-    var resultEl = document.getElementById('single-node-import-result');
-    var uri = (input && input.value || '').trim();
-    if (!uri) return toast('请粘贴单个节点 URI', 'warn');
-    if (!/^(ss|vmess|vless|trojan|hysteria2|hy2):\/\//i.test(uri)) {
-      return toast('只支持 ss/vmess/vless/trojan/hy2 节点 URI', 'warn');
-    }
-    singleImportBtn.disabled = true;
-    if (resultEl) resultEl.textContent = '添加中...';
-    api.importNodes(uri).then(function (r) {
-      toast('单个节点添加完成: 新增 ' + r.added + ', 跳过 ' + r.skipped, 'ok');
-      if (resultEl) resultEl.textContent = '新增 ' + r.added + ', 跳过 ' + r.skipped;
-      if (input && r.added > 0) input.value = '';
-      loadNodes();
-    }).catch(function (e) {
-      toast('添加失败: ' + e.message, 'err');
-      if (resultEl) resultEl.textContent = '失败: ' + e.message;
-    }).then(function () {
-      singleImportBtn.disabled = false;
-    });
-  };
-
   var importBtn = document.getElementById('import-btn');
   if (importBtn) importBtn.onclick = function () {
     var text = (document.getElementById('import-text') || {}).value || '';

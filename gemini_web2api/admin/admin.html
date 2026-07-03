@@ -284,17 +284,7 @@
               <h2 class="card-title">手动导入节点</h2>
               <span class="card-sub">粘贴内容，非订阅源管理</span>
             </div>
-            <p class="muted">添加单个节点 URI，或批量粘贴 Clash YAML / 多行节点 URI。如需添加订阅源，请使用上方“订阅源同步”。</p>
-            <div class="form-grid single-node-form">
-              <label class="field field-full">
-                <span class="field-label">单个节点 URI</span>
-                <input type="text" id="single-node-uri" placeholder="ss://... / vmess://... / vless://... / trojan://... / hy2://..." />
-              </label>
-              <div class="form-actions">
-                <button class="btn btn-primary" id="single-node-import-btn">添加单个节点</button>
-                <span class="muted" id="single-node-import-result"></span>
-              </div>
-            </div>
+            <p class="muted">粘贴 Clash YAML 配置或节点 URI (每行一个)。如需添加订阅源，请使用上方“订阅源同步”。</p>
             <textarea id="import-text" class="import-textarea" rows="6" placeholder="proxies:&#10;  - name: ...&#10;  - type: ss ...&#10;或 ss://...&#10;或 vmess://...&#10;或 trojan://..."></textarea>
             <div class="form-actions">
               <button class="btn btn-primary" id="import-btn">导入</button>
@@ -347,14 +337,14 @@
   <div id="toast-container" class="toast-container"></div>
 
   <!-- Scripts (load order matters) -->
-  <script src="utils.js?v=webui-6"></script>
-  <script src="api.js?v=webui-6"></script>
-  <script src="page-overview.js?v=webui-6"></script>
-  <script src="page-settings.js?v=webui-6"></script>
-  <script src="page-keys.js?v=webui-6"></script>
-  <script src="page-models.js?v=webui-6"></script>
-  <script src="page-nodes.js?v=webui-6"></script>
-  <script src="page-appearance.js?v=webui-6"></script>
-  <script src="admin.js?v=webui-6"></script>
+  <script src="utils.js?v=webui-5"></script>
+  <script src="api.js?v=webui-5"></script>
+  <script src="page-overview.js?v=webui-5"></script>
+  <script src="page-settings.js?v=webui-5"></script>
+  <script src="page-keys.js?v=webui-5"></script>
+  <script src="page-models.js?v=webui-5"></script>
+  <script src="page-nodes.js?v=webui-5"></script>
+  <script src="page-appearance.js?v=webui-5"></script>
+  <script src="admin.js?v=webui-5"></script>
 </body>
 </html>
