@@ -5,9 +5,9 @@ import threading
 
 from .config import CONFIG, load_config, find_config, load_env, ensure_admin_password, get_config_path, get_data_dir
 from .models import MODELS
-from .gemini import HAS_HTTPX
+from .gemini import HAS_HTTPX, update_bl_if_needed
 from .server import GeminiHandler, ThreadedServer
-from . import admin_session
+from . import admin_api, admin_session
 from . import __version__
 
 
@@ -32,6 +32,10 @@ def main():
     if args.proxy:
         CONFIG["proxy"] = args.proxy
 
+    # Keep the Gemini Web frontend version current. If startup cannot reach the
+    # page, requests still use the configured value and retry a 405 in-band.
+    update_bl_if_needed()
+
     # Ensure admin password exists (auto-generate + persist if missing)
     ensure_admin_password()
 
@@ -54,9 +58,11 @@ def main():
     print(f"  Data dir:  {get_data_dir()}")
     print(f"  Models:    {', '.join(MODELS.keys())}")
     print(f"  Cookie:    {'yes' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
-    print(f"  API Auth:  {'enabled' if (CONFIG.get('api_key') or CONFIG.get('api_keys')) else 'disabled'}")
+    print(f"  API Auth:  {'enabled' if admin_api.get_all_key_values() else 'disabled'}")
     print(f"  Proxy:     {CONFIG.get('proxy') or 'system env'}")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
+    print(f"  BL:        {CONFIG['gemini_bl']}")
+    print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")
     print()
     try:
         server.serve_forever()

@@ -163,8 +163,12 @@ class AdminAPI:
         self.handler.send_json(data, status)
 
     def _parse_body(self):
-        length = int(self.handler.headers.get("Content-Length", 0))
-        body = self.handler.rfile.read(length) if length else b""
+        reader = getattr(self.handler, "_read_request_body", None)
+        if callable(reader):
+            body = reader()
+        else:
+            length = int(self.handler.headers.get("Content-Length", 0))
+            body = self.handler.rfile.read(length) if length else b""
         try:
             return json.loads(body) if body else {}
         except (json.JSONDecodeError, ValueError):

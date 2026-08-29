@@ -8,12 +8,13 @@ import ssl
 import ipaddress
 import socket
 import re
+from urllib.parse import urlparse
 
 from .config import CONFIG
 from .gemini import load_cookie, make_sapisidhash, _get_ssl_ctx, log
 
 
-def _get_page_tokens() -> dict:
+def _get_page_tokens(proxy=None) -> dict:
     """Fetch WIZ_global_data tokens from Gemini page (Push-ID, X-Client-Pctx)."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -21,9 +22,19 @@ def _get_page_tokens() -> dict:
     cookie_str, sapisid = load_cookie()
     if cookie_str:
         headers["Cookie"] = cookie_str
+    if sapisid:
+        headers["Authorization"] = make_sapisidhash(sapisid)
     try:
         req = urllib.request.Request("https://gemini.google.com/app", headers=headers)
-        resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=30)
+        proxy = CONFIG.get("proxy") if proxy is None else proxy
+        if proxy:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                urllib.request.HTTPSHandler(context=_get_ssl_ctx()),
+            )
+            resp = opener.open(req, timeout=30)
+        else:
+            resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=30)
         html = resp.read().decode()
         tokens = {}
         for key, pattern in [
@@ -40,26 +51,58 @@ def _get_page_tokens() -> dict:
         return {}
 
 
-_page_tokens_cache = {"tokens": {}, "ts": 0}
+_page_tokens_cache = {"tokens": {}, "ts": 0, "proxy": None}
 
 
-def _cached_page_tokens() -> dict:
+def _cached_page_tokens(proxy=None) -> dict:
     now = time.time()
-    if now - _page_tokens_cache["ts"] > 600:
-        _page_tokens_cache["tokens"] = _get_page_tokens()
+    effective_proxy = CONFIG.get("proxy") if proxy is None else proxy
+    if now - _page_tokens_cache["ts"] > 600 or _page_tokens_cache["proxy"] != effective_proxy:
+        _page_tokens_cache["tokens"] = _get_page_tokens(effective_proxy)
         _page_tokens_cache["ts"] = now
+        _page_tokens_cache["proxy"] = effective_proxy
     return _page_tokens_cache["tokens"]
 
 
-def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str = "image/png") -> str:
+def detect_image_mime(image_bytes: bytes, fallback: str = "image/png") -> str:
+    """Infer a common raster image MIME type from its file signature."""
+    if not isinstance(image_bytes, bytes):
+        return fallback
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if image_bytes.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    if image_bytes.startswith(b"BM"):
+        return "image/bmp"
+    if image_bytes.startswith((b"II*\x00", b"MM\x00*")):
+        return "image/tiff"
+    if len(image_bytes) >= 12 and image_bytes[4:8] == b"ftyp":
+        brand = image_bytes[8:12]
+        if brand in (b"avif", b"avis"):
+            return "image/avif"
+        if brand in (b"heic", b"heix", b"hevc", b"hevx"):
+            return "image/heic"
+    return fallback
+
+
+def upload_image(
+    image_bytes: bytes,
+    filename: str = "image.png",
+    mime_type: str = "image/png",
+    proxy=None,
+) -> str:
     """Upload image via Scotty resumable upload. Returns file reference path."""
-    tokens = _cached_page_tokens()
+    tokens = _cached_page_tokens(proxy)
     push_id = tokens.get("push_id", "feeds/mcudyrk2a4khkz")
     pctx = tokens.get("pctx", "CgcSBWjK7pYx")
 
     cookie_str, sapisid = load_cookie()
     ctx = _get_ssl_ctx()
-    proxy = CONFIG.get("proxy")
+    proxy = CONFIG.get("proxy") if proxy is None else proxy
 
     # Step 1: Initiate resumable upload
     start_headers = {
@@ -118,8 +161,12 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
     return file_ref
 
 
-def fetch_image_bytes(url: str) -> bytes:
+def fetch_image_bytes(url: str, proxy=None) -> bytes:
     """Fetch image from URL."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        log(f"Image fetch skipped for unsupported URL scheme: {parsed.scheme or 'none'}")
+        return b""
     try:
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
@@ -129,7 +176,15 @@ def fetch_image_bytes(url: str) -> bytes:
             if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
                 raise ValueError("refusing to fetch private image URL")
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        resp = urllib.request.urlopen(req, timeout=30)
+        proxy = CONFIG.get("proxy") if proxy is None else proxy
+        if proxy:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                urllib.request.HTTPSHandler(context=_get_ssl_ctx()),
+            )
+            resp = opener.open(req, timeout=30)
+        else:
+            resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=30)
         return resp.read()
     except Exception as e:
         log(f"Image fetch failed: {e}")

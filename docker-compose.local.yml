@@ -7,5 +7,5 @@ services:
     environment:
       PORT: 8080
     volumes:
-      - ./config.json:/app/config.json
+      - ./data:/app/config
     restart: unless-stopped

@@ -8,7 +8,7 @@
   // All known settings fields, kept in sync with backend SETTINGS_FIELDS.
   var FIELDS = [
     'retry_attempts', 'retry_delay_sec', 'request_timeout_sec',
-    'default_model', 'log_requests', 'gemini_bl',
+    'default_model', 'log_requests', 'temporary_chats', 'gemini_bl',
     'auth_user', 'xsrf_token', 'proxy', 'cookie_file'
   ];
 

@@ -125,9 +125,9 @@ def _headers_to_pairs(headers):
     return [[str(k), str(v)] for k, v in headers.items()]
 
 
-def _payload(url, headers, body_bytes, proxy, timeout_sec):
+def _payload(url, headers, body_bytes, proxy, timeout_sec, method="POST"):
     return json.dumps({
-        "method": "POST",
+        "method": method,
         "url": url,
         "headers": _headers_to_pairs(headers),
         "body_base64": base64.b64encode(body_bytes).decode("ascii"),
@@ -153,6 +153,23 @@ def _request(path, payload, timeout_sec):
 
 def post(url, headers, body_bytes, proxy, timeout_sec):
     payload = _payload(url, headers, body_bytes, proxy, timeout_sec)
+    try:
+        with _request("/request", payload, timeout_sec) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Gemini TLS helper request failed ({e.code}): {detail}") from e
+    status = int(data.get("status", 0) or 0)
+    body = base64.b64decode(data.get("body_base64", ""))
+    if status >= 400:
+        msg = body.decode("utf-8", errors="replace")[:1000]
+        raise RuntimeError(f"Gemini upstream returned HTTP {status}: {msg}")
+    return body.decode("utf-8", errors="replace")
+
+
+def get(url, headers, proxy, timeout_sec):
+    """Fetch a page through the same browser-like transport used for requests."""
+    payload = _payload(url, headers, b"", proxy, timeout_sec, method="GET")
     try:
         with _request("/request", payload, timeout_sec) as resp:
             data = json.loads(resp.read().decode("utf-8"))

@@ -111,12 +111,31 @@ def _classify_proxy_error(exc: Exception) -> str:
     return "unknown"
 
 
-def _select_mihomo_proxy(failed_nodes):
+def _select_mihomo_proxy(failed_nodes, preferred_raw_uri=None):
     try:
         from . import mihomo
-        return mihomo.get_proxy_for_request(exclude=failed_nodes, attempts=_node_attempts())
+        return mihomo.get_proxy_for_request(
+            preferred_raw_uri=preferred_raw_uri,
+            exclude=failed_nodes,
+            attempts=_node_attempts(),
+        )
     except Exception as e:
         return None, None, str(e)
+
+
+def select_request_proxy():
+    """Select the proxy route used to prepare an image-bearing request.
+
+    Returns ``(raw_uri, proxy_url)``.  A raw URI is present only when the
+    custom Mihomo node pool selected the route; callers can pass it back to
+    generate()/generate_stream() so upload and inference prefer the same node.
+    """
+    if not _enabled_clash_candidates_exist():
+        return None, CONFIG.get("proxy")
+    raw_uri, proxy, message = _select_mihomo_proxy(set())
+    if not proxy:
+        raise RuntimeError(f"Mihomo node pool unavailable: {message}")
+    return raw_uri, proxy
 
 
 def _record_node_health(raw_uri, success, latency_ms=0, error=None):
@@ -207,6 +226,80 @@ def _account_prefix() -> str:
     return f"/u/{auth_user}"
 
 
+def _http_status(exc: Exception):
+    """Best-effort HTTP status extraction across urllib/httpx/helper errors."""
+    for attr in ("code", "status", "status_code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+    response = getattr(exc, "response", None)
+    value = getattr(response, "status_code", None)
+    if isinstance(value, int):
+        return value
+    match = re.search(r"(?:HTTP(?:\s+status)?\s+|\()(\d{3})(?:\)|:|\b)", str(exc), re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def fetch_latest_bl(proxy=None):
+    """Fetch the current Gemini Web frontend version through the active route."""
+    try:
+        account_prefix = _account_prefix()
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+        }
+        cookie_str, sapisid = load_cookie()
+        if cookie_str:
+            headers["Cookie"] = cookie_str
+        if sapisid:
+            headers["Authorization"] = make_sapisidhash(sapisid)
+        if account_prefix:
+            headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
+
+        request = urllib.request.Request(
+            f"https://gemini.google.com{account_prefix}/app",
+            headers=headers,
+        )
+        effective_proxy = CONFIG.get("proxy") if proxy is None else proxy
+        if effective_proxy:
+            from . import browser_transport
+            if browser_transport.available():
+                html = browser_transport.get(
+                    request.full_url,
+                    headers,
+                    effective_proxy,
+                    15,
+                )
+            else:
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({"http": effective_proxy, "https": effective_proxy}),
+                    urllib.request.HTTPSHandler(context=_get_ssl_ctx()),
+                )
+                with opener.open(request, timeout=15) as response:
+                    html = response.read().decode("utf-8", errors="replace")
+        else:
+            with urllib.request.urlopen(request, context=_get_ssl_ctx(), timeout=15) as response:
+                html = response.read().decode("utf-8", errors="replace")
+        match = re.search(r"(boq_assistant-bard-web-server_\d+\.\d+_p\d+)", html)
+        return match.group(1) if match else None
+    except Exception as e:
+        log(f"BL auto-update fetch failed: {e}")
+        return None
+
+
+def update_bl_if_needed(proxy=None) -> bool:
+    """Refresh the Gemini Web frontend version and report whether it changed."""
+    new_bl = fetch_latest_bl(proxy)
+    old_bl = CONFIG.get("gemini_bl")
+    if new_bl and new_bl != old_bl:
+        CONFIG["gemini_bl"] = new_bl
+        log(f"BL auto-updated: {old_bl} -> {new_bl}")
+        return True
+    return False
+
+
 def _build_headers() -> dict:
     account_prefix = _account_prefix()
     headers = {
@@ -237,6 +330,16 @@ def _build_headers() -> dict:
     return headers
 
 
+def _apply_chat_persistence_flags(inner: list) -> None:
+    """Apply Gemini Web persistence flags to an outgoing request payload."""
+    if CONFIG.get("temporary_chats", False):
+        # Match Gemini Web temporary-chat requests.
+        inner[41] = [1]
+        inner[45] = 1
+    else:
+        inner[41] = [2]
+
+
 def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
     inner = [None] * 102
     if file_refs:
@@ -254,7 +357,7 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     inner[18] = 0
     inner[27] = 1
     inner[30] = [4]
-    inner[41] = [2]
+    _apply_chat_persistence_flags(inner)
     inner[53] = 0
     inner[59] = str(uuid.uuid4())
     inner[61] = []
@@ -280,13 +383,13 @@ def _get_url() -> str:
     )
 
 
-def clean_text(text: str) -> str:
+def clean_text(text: str, strip: bool = True) -> str:
     text = re.sub(
         r'```(?:python|javascript|text)\?code_(?:reference|stdout)&code_event_index=\d+\n.*?```\n?',
         '', text, flags=re.DOTALL
     )
     text = re.sub(r'http://googleusercontent\.com/card_content/\d+\n?', '', text)
-    return text.strip()
+    return text.strip() if strip else text
 
 
 def _extract_texts_from_line(line: str) -> list:
@@ -330,7 +433,14 @@ def extract_response_text(raw: str) -> str:
     return clean_text(last_text)
 
 
-def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
+def generate(
+    prompt: str,
+    model_id: int,
+    think_mode: int,
+    file_refs: list = None,
+    extra_fields: dict = None,
+    preferred_raw_uri: str = None,
+) -> str:
     """Non-streaming generation with retry."""
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
@@ -354,7 +464,8 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
         raw_uri = None
         proxy = None
         if has_node_pool:
-            raw_uri, proxy, proxy_msg = _select_mihomo_proxy(failed_nodes)
+            preferred = preferred_raw_uri if attempt == 0 else None
+            raw_uri, proxy, proxy_msg = _select_mihomo_proxy(failed_nodes, preferred)
             if not proxy:
                 last_err = RuntimeError(f"Mihomo node pool unavailable: {proxy_msg}")
                 log(str(last_err))
@@ -366,12 +477,21 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             proxy = CONFIG.get("proxy")
         try:
             started = time.time()
-            raw = _post_upstream(body, url, headers, proxy, ctx)
+            for bl_attempt in range(2):
+                try:
+                    raw = _post_upstream(body, url, headers, proxy, ctx)
+                    break
+                except Exception as e:
+                    if bl_attempt == 0 and _http_status(e) == 405 and update_bl_if_needed(proxy):
+                        url = _get_url()
+                        log("Retrying with updated BL...")
+                        continue
+                    raise
             _record_node_health(raw_uri, True, latency_ms=int((time.time() - started) * 1000))
             return extract_response_text(raw)
         except Exception as e:
             last_err = e
-            if raw_uri:
+            if raw_uri and _http_status(e) != 405:
                 failed_nodes.add(raw_uri)
                 _record_node_health(raw_uri, False, error=e)
             if attempt < attempts - 1:
@@ -380,7 +500,14 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     raise last_err
 
 
-def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
+def generate_stream(
+    prompt: str,
+    model_id: int,
+    think_mode: int,
+    file_refs: list = None,
+    extra_fields: dict = None,
+    preferred_raw_uri: str = None,
+):
     """Streaming generation with retry on connection failure."""
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
@@ -404,7 +531,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
 
     last_err = None
     failed_nodes = set()
-    yielded = False
+    emitted_raw_text = ""
     attempts = _node_attempts() if has_node_pool else CONFIG["retry_attempts"]
     for attempt in range(attempts):
         raw_uri = None
@@ -412,7 +539,8 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         client = None
         try:
             if has_node_pool:
-                raw_uri, proxy, proxy_msg = _select_mihomo_proxy(failed_nodes)
+                preferred = preferred_raw_uri if attempt == 0 else None
+                raw_uri, proxy, proxy_msg = _select_mihomo_proxy(failed_nodes, preferred)
                 if not proxy:
                     last_err = RuntimeError(f"Mihomo node pool unavailable: {proxy_msg}")
                     log(str(last_err))
@@ -430,7 +558,6 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                         )
                 else:
                     started = time.time()
-                    prev_text = ""
                     buf = ""
                     for chunk in browser_transport.stream(url, headers, body, proxy, CONFIG["request_timeout_sec"]):
                         buf += chunk
@@ -438,12 +565,14 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                         while "\n" in buf:
                             line, buf = buf.split("\n", 1)
                             for t in _extract_texts_from_line(line):
-                                if len(t) > len(prev_text):
-                                    delta = clean_text(t[len(prev_text):])
-                                    if delta:
-                                        yielded = True
-                                        yield delta
-                                    prev_text = t
+                                if t == emitted_raw_text or emitted_raw_text.startswith(t):
+                                    continue
+                                if not t.startswith(emitted_raw_text):
+                                    raise RuntimeError("Gemini stream content changed during retry")
+                                delta = clean_text(t[len(emitted_raw_text):], strip=False)
+                                emitted_raw_text = t
+                                if delta:
+                                    yield delta
                     _record_node_health(raw_uri, True, latency_ms=int((time.time() - started) * 1000))
                     return
 
@@ -458,8 +587,8 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
             else:
                 client = httpx.Client(timeout=CONFIG["request_timeout_sec"], verify=True, trust_env=False)
             started = time.time()
-            prev_text = ""
             with client.stream("POST", url, content=body, headers=headers) as resp:
+                resp.raise_for_status()
                 buf = ""
                 for chunk in resp.iter_text():
                     buf += chunk
@@ -467,21 +596,35 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         for t in _extract_texts_from_line(line):
-                            if len(t) > len(prev_text):
-                                delta = clean_text(t[len(prev_text):])
-                                if delta:
-                                    yielded = True
-                                    yield delta
-                                prev_text = t
+                            if t == emitted_raw_text or emitted_raw_text.startswith(t):
+                                continue
+                            if not t.startswith(emitted_raw_text):
+                                raise RuntimeError("Gemini stream content changed during retry")
+                            delta = clean_text(t[len(emitted_raw_text):], strip=False)
+                            emitted_raw_text = t
+                            if delta:
+                                yield delta
             _record_node_health(raw_uri, True, latency_ms=int((time.time() - started) * 1000))
             return
         except Exception as e:
             last_err = e
-            if raw_uri:
+            if str(e) == "Gemini stream content changed during retry":
+                raise
+            if _http_status(e) == 405 and not emitted_raw_text and update_bl_if_needed(proxy):
+                log("Retrying stream with updated BL...")
+                for delta in generate_stream(
+                    prompt,
+                    model_id,
+                    think_mode,
+                    file_refs,
+                    extra_fields,
+                    preferred_raw_uri=raw_uri or preferred_raw_uri,
+                ):
+                    yield delta
+                return
+            if raw_uri and _http_status(e) != 405:
                 failed_nodes.add(raw_uri)
                 _record_node_health(raw_uri, False, error=e)
-            if yielded:
-                raise
             if attempt < attempts - 1:
                 log(f"Stream retry {attempt+1}/{attempts}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])

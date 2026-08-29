@@ -6,17 +6,17 @@
 
 [中文文档](README_CN.md)
 
-Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, cross-platform, single file.
+Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, cross-platform, with an integrated admin UI and proxy node pool.
 
 ## Features
 
 - **Optional API Keys**: no auth when `api_keys` is empty, OpenAI-style Bearer auth when configured
 - **OpenAI Compatible**: Drop-in replacement for `/v1/chat/completions` and `/v1/models`
 - **Tool Calling**: Full function calling support (OpenAI format)
-- **Multiple Models**: Flash, Flash Thinking (20k+ char output), Pro, Auto, Lite
+- **Multiple Models**: Flash (3.7/3.6), Extended Thinking (20k+ char output), Pro, Auto, Lite
 - **Thinking Depth**: Adjustable via `@think=N` suffix (0=deepest, 4=shallowest)
 - **Web Search**: Built-in internet access (Gemini's native search)
-- **Cross-Platform**: Pure Python, single optional dependency (`httpx` for streaming)
+- **Cross-Platform**: Python service; Docker bundles the optional Mihomo node engine and Go TLS helper
 - **Streaming**: SSE streaming support via `httpx`
 - **Codex CLI**: Responses API (`/v1/responses`) for OpenAI Codex integration
 - **Gemini CLI**: Google native API (`/v1beta/models`) for Gemini CLI compatibility
@@ -24,7 +24,7 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, 
 ## Quick Start
 
 ```bash
-pip install httpx
+pip install -r requirements.txt
 python gemini_web2api.py
 ```
 
@@ -88,12 +88,14 @@ Supports Google native API endpoints:
 
 | Model | Description | Output |
 |-------|-------------|--------|
-| `gemini-3.5-flash` | Fast general-purpose | ~12k chars |
-| `gemini-3.5-flash-thinking` | Deep thinking, longest output | **~20k chars** |
+| `gemini-3.7-flash` | Latest all-around model | ~12k chars |
+| `gemini-3.6-flash` | All-around model | ~12k chars |
+| `gemini-3.5-flash` | Alias for gemini-3.6-flash | ~12k chars |
+| `gemini-3.5-flash-thinking` | Extended thinking, longest output | **~20k chars** |
 | `gemini-3.5-flash-thinking-lite` | Adaptive thinking depth | ~15k chars |
-| `gemini-3.1-pro` | Pro (needs cookie for real routing) | ~12k chars |
+| `gemini-3.1-pro` | Advanced math & code (needs cookie) | ~12k chars |
 | `gemini-auto` | Auto model selection | varies |
-| `gemini-flash-lite` | Lightweight fast | ~10k chars |
+| `gemini-flash-lite` | Fastest answers, lightweight | ~10k chars |
 
 ### Thinking Depth
 
@@ -169,18 +171,21 @@ Create `config.json` in the same directory:
   "request_timeout_sec": 180,
   "api_key": null,
   "api_keys": [],
-  "gemini_bl": "boq_assistant-bard-web-server_20260525.09_p0",
+  "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
+  "default_model": "gemini-3.6-flash",
   "auth_user": null,
   "xsrf_token": null,
+  "admin_password": null,
   "cookie_file": null,
   "proxy": null,
-  "log_requests": true
+  "log_requests": true,
+  "temporary_chats": false
 }
 ```
 
 ## API Key Authentication
 
-Authentication is disabled by default for backward compatibility. If you configure an API key, requests to `/v1/models`, `/v1/chat/completions`, and `/v1/responses` must include:
+Authentication is disabled by default for backward compatibility. If you configure an API key, requests to `/v1/*` and `/v1beta/*` must authenticate. Supported forms are `Authorization: Bearer <key>`, `x-api-key`, `x-goog-api-key`, and the Gemini CLI-style `?key=<key>` query parameter.
 
 ```http
 Authorization: Bearer your-key
@@ -213,7 +218,16 @@ Multiple keys are also supported:
 
 Use the configured key as the API key in OpenAI-compatible clients.
 
-When `api_keys` is `[]` and `api_key` is `null`, authentication is disabled.
+Set `temporary_chats` to `true` to use Gemini Web temporary chats instead of
+persisting conversations to the account history.
+
+When `api_keys` is `[]`, `api_key` is `null`, and the admin key store is empty, authentication is disabled.
+
+## Admin UI and node pool
+
+Open `/admin/` and sign in with `admin_password`. If no password is configured, the service generates one on first boot and prints it once. `GEMINI_WEB2API_ADMIN_PASSWORD` overrides the stored value.
+
+The fork's admin UI manages API keys, runtime settings, Clash-compatible subscriptions, node health, and per-node Mihomo workers. Docker images include Mihomo and the Go `tls-client` helper; imported nodes are selected with health-aware retries while proxied Gemini traffic keeps browser-like TLS behavior.
 
 ## Docker
 
@@ -225,19 +239,25 @@ docker run -d --name gemini-web2api -p 8080:8080 -e GEMINI_WEB2API_API_KEY=sk-yo
 Or use Docker Compose:
 
 ```bash
-cp config.example.json config.json
-docker compose up -d
+mkdir -p data
+cp config.example.json data/config.json
+docker compose -f docker-compose.local.yml up -d
 ```
 
 To mount a cookie file:
 
 ```bash
-docker run -d --name gemini-web2api -p 8080:8080 -v ./config.json:/app/config.json -v ./cookie.txt:/app/cookie.txt gemini-web2api
+mkdir -p data
+cp config.example.json data/config.json
+docker run -d --name gemini-web2api -p 8080:8080 \
+  -v "$PWD/data:/app/config" \
+  -v "$PWD/cookie.txt:/app/config/cookie.txt:ro" \
+  gemini-web2api
 ```
 
-Set `"cookie_file": "/app/cookie.txt"` in `config.json`.
+Set `"cookie_file": "/app/config/cookie.txt"` in `data/config.json`.
 
-For Zeabur Docker deployment, expose container port `8080` and set only the environment variables you need, for example `GEMINI_WEB2API_API_KEY`.
+For Zeabur Docker deployment, expose container port `8080`, mount a persistent volume at `/app/config`, and set only the environment variables you need, for example `GEMINI_WEB2API_API_KEY`.
 
 > **Note**: If you get empty responses (`content: null`) with Docker's default bridge network, switch to host networking: `docker run --network host ...` or add `network_mode: host` in your compose file. This is caused by Gemini's upstream rejecting requests from certain Docker NAT IP ranges.
 
@@ -280,9 +300,27 @@ resp = client.chat.completions.create(
 )
 ```
 
+## Image Input
+
+OpenAI-style multimodal messages are supported for Chat Completions and the
+Responses API. Use either HTTP(S) image URLs or base64 data URLs:
+
+```python
+resp = client.chat.completions.create(
+    model="gemini-3.6-flash",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Describe this image"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+        ]
+    }]
+)
+```
+
 ## Limitations
 
-- **No image/multimodal input**: Gemini's image upload requires a proprietary streaming RPC protocol (WIZ/ProcessFile) that cannot be replicated in a standard HTTP proxy. Image inputs in messages will be ignored with a note.
+- **Image upload may require cookies**: Multimodal input uses Gemini Web's image upload endpoint. If anonymous upload fails, configure a Gemini cookie.
 - **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
 - **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
 - **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.
@@ -291,6 +329,8 @@ resp = client.chat.completions.create(
 
 - Python 3.8+
 - `httpx` (`pip install httpx`) — used for streaming requests
+- `PyYAML` — used for Clash subscriptions and Mihomo node configuration
+- Network access to download/run Mihomo only when using the managed node pool (the Docker image bundles it)
 - Network access to `gemini.google.com` (proxy/VPN may be needed in some regions)
 
 ## How It Works

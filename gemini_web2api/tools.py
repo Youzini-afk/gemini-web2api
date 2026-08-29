@@ -3,9 +3,12 @@ import json
 import re
 import uuid
 import base64
+import binascii
 import io
+from urllib.parse import unquote_to_bytes
 
 MAX_IMAGE_B64_SIZE = 50000  # ~37KB raw image
+PROMPT_MAX_BYTES = 60000
 
 
 def _compress_b64_if_needed(b64: str) -> str:
@@ -51,6 +54,70 @@ def _build_tool_choice_instruction(tool_choice, tool_defs: list) -> str:
     return ""
 
 
+def _decode_data_url(url: str):
+    match = re.match(r"^data:([^;,]+)?(;base64)?,(.*)$", url, re.DOTALL)
+    if not match:
+        return None
+    mime = match.group(1) or "image/png"
+    is_base64 = bool(match.group(2))
+    data = match.group(3)
+    try:
+        if is_base64:
+            return base64.b64decode(data, validate=True), mime
+        return unquote_to_bytes(data), mime
+    except (ValueError, TypeError, binascii.Error):
+        return None
+
+
+def _image_from_url(url: str, mime: str = None):
+    if not isinstance(url, str) or not url:
+        return None
+    if url.startswith("data:"):
+        return _decode_data_url(url)
+    return url, mime or "image/png"
+
+
+def _image_from_part(part: dict):
+    part_type = part.get("type")
+    if part_type == "image_url":
+        image_url = part.get("image_url", {})
+        if isinstance(image_url, dict):
+            return _image_from_url(image_url.get("url"), image_url.get("mime_type"))
+        return _image_from_url(image_url)
+    if part_type in ("input_image", "image"):
+        source = part.get("source")
+        if isinstance(source, dict):
+            source_type = source.get("type")
+            if source_type == "base64":
+                image_data = source.get("data")
+                if isinstance(image_data, str):
+                    mime = source.get("media_type") or source.get("mime_type") or "image/png"
+                    try:
+                        return base64.b64decode(image_data, validate=True), mime
+                    except (ValueError, TypeError, binascii.Error):
+                        return None
+            if source_type == "url":
+                return _image_from_url(
+                    source.get("url"),
+                    source.get("media_type") or source.get("mime_type"),
+                )
+        image_url = part.get("image_url") or part.get("url")
+        if isinstance(image_url, dict):
+            return _image_from_url(image_url.get("url"), image_url.get("mime_type"))
+        if image_url:
+            return _image_from_url(image_url, part.get("mime_type"))
+        image_data = part.get("data") or part.get("base64")
+        if isinstance(image_data, str):
+            mime = part.get("mime_type") or part.get("media_type") or "image/png"
+            if image_data.startswith("data:"):
+                return _decode_data_url(image_data)
+            try:
+                return base64.b64decode(image_data, validate=True), mime
+            except (ValueError, TypeError, binascii.Error):
+                return None
+    return None
+
+
 def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> tuple:
     """Convert OpenAI messages to (prompt_str, images_list).
 
@@ -70,12 +137,21 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
             })
         if tool_defs:
             constraint = _build_tool_choice_instruction(tool_choice, tool_defs)
+            tools_json = json.dumps(tool_defs, indent=2)
+            if len(tools_json.encode("utf-8")) > PROMPT_MAX_BYTES // 2:
+                slim_defs = [
+                    {"name": tool["name"], "description": tool["description"]}
+                    for tool in tool_defs
+                ]
+                tools_json = json.dumps(slim_defs, indent=2)
+                from .gemini import log
+                log(f"Tools block too large ({len(tool_defs)} tools), stripped parameters")
             parts.append(
                 "# Tool Use\n\n"
                 "You can call the following tools. Call format:\n"
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
                 "When calling tools, output ONLY the tool_call block(s).\n\n"
-                f"Available tools:\n{json.dumps(tool_defs, indent=2)}"
+                f"Available tools:\n{tools_json}"
                 f"{constraint}"
             )
 
@@ -88,22 +164,11 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
             for c in content:
                 if c.get("type") in ("text", "input_text"):
                     text_parts.append(c.get("text", ""))
-                elif c.get("type") == "image_url":
-                    src = c.get("image_url", {})
-                    url = src.get("url") if isinstance(src, dict) else src
-                    if isinstance(url, str) and url.startswith("data:"):
-                        header, b64 = url.split(",", 1)
-                        mime = header.split(";")[0].replace("data:", "") or "image/png"
-                        images.append((base64.b64decode(b64), mime))
-                    elif isinstance(url, str) and url:
-                        images.append((url, None))
-                elif c.get("type") == "image":
-                    src = c.get("source", {})
-                    if src.get("type") == "base64":
-                        mime = src.get("media_type", "image/png")
-                        images.append((base64.b64decode(src["data"]), mime))
-                    else:
-                        text_parts.append("[Note: Unsupported image input. Please describe the image in text.]")
+                else:
+                    image = _image_from_part(c)
+                    if image:
+                        images.append(image)
+                        text_parts.append("[Image attached]")
             content = " ".join(text_parts)
 
         if role == "system":
@@ -238,8 +303,14 @@ def google_contents_to_prompt(req: dict) -> tuple:
                 msg_parts.append(p["text"])
             elif p.get("inlineData"):
                 data = p["inlineData"]
-                mime = data.get("mimeType", "image/png")
-                images.append((base64.b64decode(data["data"]), mime))
+                try:
+                    images.append((
+                        base64.b64decode(data["data"], validate=True),
+                        data.get("mimeType", "image/png"),
+                    ))
+                    msg_parts.append("[Image attached]")
+                except (KeyError, ValueError, TypeError, binascii.Error):
+                    pass
             elif p.get("functionCall"):
                 fc = p["functionCall"]
                 msg_parts.append(

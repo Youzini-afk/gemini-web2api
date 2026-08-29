@@ -6,17 +6,17 @@
 
 [English](README.md)
 
-将 Google Gemini 网页端转换为 OpenAI 兼容 API. 零成本, 跨平台, 单文件.
+将 Google Gemini 网页端转换为 OpenAI 兼容 API，并集成管理后台与代理节点池。零成本、跨平台。
 
 ## 特性
 
 - **可选密钥**: `api_keys` 为空时免密, 填入密钥后按 OpenAI Bearer Key 校验
 - **OpenAI 兼容**: 直接替换 `/v1/chat/completions` 和 `/v1/models`
 - **工具调用**: 完整的 Function Calling 支持 (OpenAI 格式)
-- **多模型**: Flash, Flash Thinking (2万字+输出), Pro, Auto, Lite
+- **多模型**: Flash (3.7/3.6), 扩展思考 (2万字+输出), Pro, Auto, Lite
 - **思考深度**: 通过 `@think=N` 后缀调节 (0=最深, 4=最浅)
 - **联网搜索**: 内置互联网访问 (Gemini 原生搜索能力)
-- **跨平台**: 纯 Python, 仅一个可选依赖 (`httpx` 用于流式输出)
+- **跨平台**: Python 服务；Docker 镜像内置可选的 Mihomo 节点引擎和 Go TLS helper
 - **流式输出**: 基于 `httpx` 的 SSE Streaming 支持
 - **Codex CLI**: Responses API (`/v1/responses`) 兼容 OpenAI Codex
 - **Gemini CLI**: Google 原生 API (`/v1beta/models`) 兼容 Gemini CLI
@@ -24,7 +24,7 @@
 ## 快速开始
 
 ```bash
-pip install httpx
+pip install -r requirements.txt
 python gemini_web2api.py
 ```
 
@@ -78,12 +78,14 @@ gemini
 
 | 模型 | 说明 | 输出量 |
 |------|------|--------|
-| `gemini-3.5-flash` | 快速通用 | ~1.2万字 |
-| `gemini-3.5-flash-thinking` | 深度思考, 最长输出 | **~2万字** |
+| `gemini-3.7-flash` | 最新全能模型 | ~1.2万字 |
+| `gemini-3.6-flash` | 全能模型 | ~1.2万字 |
+| `gemini-3.5-flash` | gemini-3.6-flash 别名 | ~1.2万字 |
+| `gemini-3.5-flash-thinking` | 扩展思考, 最长输出 | **~2万字** |
 | `gemini-3.5-flash-thinking-lite` | 自适应思考深度 | ~1.5万字 |
-| `gemini-3.1-pro` | Pro (需 cookie 才能真正路由) | ~1.2万字 |
+| `gemini-3.1-pro` | 高级数学与代码 (需 cookie) | ~1.2万字 |
 | `gemini-auto` | 自动选择模型 | 不定 |
-| `gemini-flash-lite` | 轻量快速 | ~1万字 |
+| `gemini-flash-lite` | 最快响应, 轻量 | ~1万字 |
 
 ### 思考深度
 
@@ -159,18 +161,21 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "request_timeout_sec": 180,
   "api_key": null,
   "api_keys": [],
-  "gemini_bl": "boq_assistant-bard-web-server_20260525.09_p0",
+  "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
+  "default_model": "gemini-3.6-flash",
   "auth_user": null,
   "xsrf_token": null,
+  "admin_password": null,
   "cookie_file": null,
   "proxy": null,
-  "log_requests": true
+  "log_requests": true,
+  "temporary_chats": false
 }
 ```
 
 ## API Key 鉴权
 
-默认不启用鉴权，兼容旧行为。如果配置了密钥，请求 `/v1/models`、`/v1/chat/completions`、`/v1/responses` 时必须携带：
+默认不启用鉴权，兼容旧行为。配置密钥后，`/v1/*` 和 `/v1beta/*` 均需要鉴权；支持 `Authorization: Bearer <key>`、`x-api-key`、`x-goog-api-key`，以及 Gemini CLI 使用的 `?key=<key>` 查询参数。
 
 ```http
 Authorization: Bearer 你的密钥
@@ -203,7 +208,16 @@ export API_KEY=你的密钥
 
 客户端 API Key 填你的密钥即可。
 
-当 `api_keys` 是空数组 `[]` 且 `api_key` 是 `null` 时不校验密钥。
+将 `temporary_chats` 设置为 `true` 后，请求会使用 Gemini 网页版的临时聊天，
+不会将对话保存在账号历史记录中。
+
+当 `api_keys` 为空数组、`api_key` 为 `null`，且管理后台密钥库也为空时，不校验密钥。
+
+## 管理后台与节点池
+
+访问 `/admin/`，使用 `admin_password` 登录。若未配置，服务首次启动会自动生成密码并打印一次；环境变量 `GEMINI_WEB2API_ADMIN_PASSWORD` 可覆盖保存值。
+
+本 fork 的管理后台可管理 API 密钥、运行参数、Clash 兼容订阅、节点健康状态和每节点 Mihomo worker。Docker 镜像内置 Mihomo 与 Go `tls-client` helper；导入的节点会按健康状态选择和重试，同时让代理访问 Gemini 时保持浏览器风格的 TLS 行为。
 
 ## Docker 部署
 
@@ -215,19 +229,25 @@ docker run -d --name gemini-web2api -p 8080:8080 -e GEMINI_WEB2API_API_KEY=sk-yo
 或使用 Docker Compose:
 
 ```bash
-cp config.example.json config.json
-docker compose up -d
+mkdir -p data
+cp config.example.json data/config.json
+docker compose -f docker-compose.local.yml up -d
 ```
 
 如需挂载 Cookie 文件:
 
 ```bash
-docker run -d --name gemini-web2api -p 8080:8080 -v ./config.json:/app/config.json -v ./cookie.txt:/app/cookie.txt gemini-web2api
+mkdir -p data
+cp config.example.json data/config.json
+docker run -d --name gemini-web2api -p 8080:8080 \
+  -v "$PWD/data:/app/config" \
+  -v "$PWD/cookie.txt:/app/config/cookie.txt:ro" \
+  gemini-web2api
 ```
 
-此时 `config.json` 中设置 `"cookie_file": "/app/cookie.txt"`.
+此时在 `data/config.json` 中设置 `"cookie_file": "/app/config/cookie.txt"`。
 
-Zeabur Docker 部署时暴露容器端口 `8080`，只设置需要的环境变量即可，例如 `GEMINI_WEB2API_API_KEY`。
+Zeabur Docker 部署时暴露容器端口 `8080`，将持久卷挂载到 `/app/config`，再设置需要的环境变量，例如 `GEMINI_WEB2API_API_KEY`。
 
 > **注意**: 如果 Docker 默认 bridge 网络下出现空回复 (`content: null`), 请切换到 host 网络: `docker run --network host ...` 或在 compose 文件中添加 `network_mode: host`. 这是 Gemini 上游拒绝来自 Docker NAT IP 段的请求导致的.
 
@@ -253,9 +273,27 @@ python gemini_web2api.py
 
 支持 Clash, V2Ray, Shadowsocks 等任何 HTTP 代理.
 
+## 图片输入
+
+Chat Completions 和 Responses API 支持 OpenAI 风格的多模态消息。图片可以使用
+HTTP(S) URL 或 base64 data URL:
+
+```python
+resp = client.chat.completions.create(
+    model="gemini-3.6-flash",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "描述这张图片"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+        ]
+    }]
+)
+```
+
 ## 已知限制
 
-- **不支持图片/多模态输入**: Gemini 的图片上传需要专有的 WIZ streaming RPC 协议 (ProcessFile), 无法在标准 HTTP 代理中实现. 发送图片会被忽略并返回提示.
+- **图片上传可能需要 Cookie**: 多模态输入使用 Gemini 网页端图片上传接口。匿名上传失败时, 请配置 Gemini cookie。
 - **Pro/Ultra 非真实路由**: 无付费订阅 cookie 时, `gemini-3.1-pro` 实际路由到 Flash 模型. "Pro" 只是 UI 偏好标签.
 - **单轮对话**: 每次请求是独立对话, 多轮上下文通过在 prompt 中包含历史消息模拟.
 - **频率限制**: Google 可能限制高频请求, server 会自动重试但持续高负载可能被封.
@@ -264,6 +302,8 @@ python gemini_web2api.py
 
 - Python 3.8+
 - `httpx` (`pip install httpx`) — 用于流式请求
+- `PyYAML` — 用于 Clash 订阅及 Mihomo 节点配置
+- 仅使用托管节点池时需要 Mihomo；Docker 镜像已内置
 - 需要能访问 `gemini.google.com` (部分地区需代理)
 
 ## 工作原理

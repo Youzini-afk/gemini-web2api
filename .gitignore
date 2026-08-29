@@ -9,3 +9,4 @@ api_keys.json
 .idea
 .DS_Store
 .slim/deepwork/
+gemini-auth.json

@@ -11,16 +11,17 @@ DEFAULT_CONFIG = {
     "retry_attempts": 3,
     "retry_delay_sec": 2,
     "request_timeout_sec": 180,
-    "gemini_bl": "boq_assistant-bard-web-server_20260525.09_p0",
+    "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
     "auth_user": None,
     "xsrf_token": None,
-    "default_model": "gemini-3.5-flash",
+    "default_model": "gemini-3.6-flash",
     "log_requests": True,
     "cookie_file": None,
     "proxy": None,
     "api_key": None,
     "api_keys": [],
     "admin_password": None,
+    "temporary_chats": False,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -30,7 +31,7 @@ _data_dir: str = ""
 # Fields the admin settings page can read/write (everything except internals)
 SETTINGS_FIELDS = [
     "retry_attempts", "retry_delay_sec", "request_timeout_sec",
-    "default_model", "log_requests", "gemini_bl",
+    "default_model", "log_requests", "temporary_chats", "gemini_bl",
     "auth_user", "xsrf_token", "proxy", "cookie_file",
 ]
 
@@ -129,6 +130,10 @@ def load_env():
     api_key = os.environ.get("GEMINI_WEB2API_API_KEY") or os.environ.get("API_KEY")
     if api_key:
         CONFIG["api_key"] = api_key
+    if not CONFIG.get("proxy"):
+        proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        if proxy:
+            CONFIG["proxy"] = proxy
     return CONFIG
 
 
